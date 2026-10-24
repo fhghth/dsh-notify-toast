@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Popup Notifications",
+    "description": "Pops a topmost card in the screen's bottom-right corner when a task completes or a permission approval is requested (no system notifications involved). Popup and sound toggle independently; click a card to jump back to its conversation."
+  }
+}

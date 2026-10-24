@@ -1,0 +1,8 @@
+{
+  "cfg": { "width": 400, "height": 104, "scale": 1.0, "margin": 16, "gap": 8, "maxCards": 4 },
+  "cards": [
+    { "id": "demo-1", "kind": "complete", "title": "写一个 Python 爬虫脚本", "subtitle": "任务已完成 · 用时 3 分 12 秒", "durationMs": 9000, "sound": "system:asterisk" },
+    { "id": "demo-2", "kind": "approval", "title": "重构登录模块", "subtitle": "需要权限审批 · Bash 命令", "durationMs": 9000, "sound": "system:exclamation" },
+    { "id": "demo-3", "kind": "error", "title": "修复构建脚本", "subtitle": "任务失败 · 命令退出码 1", "durationMs": 9000, "sound": "system:hand" }
+  ]
+}

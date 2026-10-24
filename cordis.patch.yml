@@ -1,0 +1,3 @@
+- insert:
+    - id: notify-toast
+      name: '@local/dsh-notify-toast'

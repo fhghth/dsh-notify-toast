@@ -1,0 +1,8 @@
+# Working files that never belong in the repository.
+node_modules/
+*.log
+events.log
+settings-dump*.json
+.sound-originals/
+.DS_Store
+Thumbs.db

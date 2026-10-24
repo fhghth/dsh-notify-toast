@@ -1,0 +1,50 @@
+{
+  "name": "@local/dsh-notify-toast",
+  "version": "1.0.0",
+  "description": "Windows desktop popup cards for DSH task completion, approval requests and agent questions",
+  "license": "MIT",
+  "author": "fhghth",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fhghth/dsh-notify-toast.git"
+  },
+  "homepage": "https://github.com/fhghth/dsh-notify-toast#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "notification",
+    "toast",
+    "windows",
+    "desktop"
+  ],
+  "type": "module",
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.3"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "notifier/ui.cs",
+    "notifier/notifier.ps1",
+    "notifier/demo.json",
+    "sounds/*.wav",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true }
+  }
+}
