@@ -8,9 +8,12 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Exactly one notifier may run per machine: a freshly started instance retires
-# older ones (orphans left by a Host reload). The Host stamps every spawn with
-# -NotifyHost, so only notifier processes carry this marker -- an unrelated
-# shell whose command text merely mentions this file is never a target.
+# older ones (orphans left by a Host reload). The Host spawns the notifier as
+#   powershell.exe ... -File <dir>\notifier.ps1 -NotifyHost
+# so a candidate is retired only when its command line ends with that exact
+# shape. Matching the bare marker is not enough: any shell whose text merely
+# mentions -NotifyHost (a diagnostic, a grep, a doc snippet) would match and be
+# force-killed, losing whatever it was doing.
 if (-not $CompileOnly -and -not $Demo) {
   try {
     $selfId = $PID
@@ -19,7 +22,7 @@ if (-not $CompileOnly -and -not $Demo) {
       if ($proc.ProcessId -eq $selfId) { continue }
       $cmd = $proc.CommandLine
       if (-not $cmd) { continue }
-      if ($cmd -notlike '*-NotifyHost*') { continue }
+      if ($cmd -notmatch '-File\s+"?[^"]*notifier\.ps1"?\s+-NotifyHost\s*$') { continue }
       try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop } catch {}
     }
   } catch {}

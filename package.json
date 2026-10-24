@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-notify-toast",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Windows desktop popup cards for DSH task completion, approval requests and agent questions",
   "license": "MIT",
   "author": "fhghth",
