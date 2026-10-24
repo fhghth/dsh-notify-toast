@@ -4,6 +4,8 @@ DSH 插件：任务完成、需要权限审批、或 Agent 向你提问时，在
 
 它**不使用 Windows 通知中心**——卡片是一个真正的窗口，由一个常驻的 .NET/WinForms 进程绘制，所以 DSH 最小化或被其他窗口盖住时依然可见。
 
+> **早期开发阶段**：插件仍在迭代，配置项与行为可能变化，也可能出现破坏性改动。按 MIT 许可「按现状」提供，不附带任何担保，使用风险自负。
+
 ## 功能
 
 - **四类卡片**：任务完成、权限审批、Agent 提问、任务失败。
@@ -104,6 +106,8 @@ Host 按需拉起**唯一**一个通知进程，展示期间保持常驻，空�
 - **虚拟桌面**：卡片创建在当前桌面，切换桌面后不会再跟过去。
 - **独占全屏、UAC 安全桌面、锁屏**：任何窗口都盖不住。
 - **审批卡片与 DSH 自己的审批框同在右下角**，会挡住按钮，需要先关掉卡片。
+- **全机单实例**：同一时间只有一个通知进程，新实例启动时会结束旧的（只认 `notifier.ps1` 的完整命令行，不会误伤其它 shell）。
+- **`link:` 安装的残留**：在 hoisted 模式下卸载 `link:` 装的插件，`node_modules` 里可能留下一个指向源码目录的 junction；不影响使用，切换安装方式前建议用 `Get-Item <profile>\node_modules\@local\dsh-notify-toast -Force` 确认一下。
 - 进程退出后的第一张卡片有约 **1.5 秒**冷启动（PowerShell + C# 编译）。
 - **升级 = 卸载后重装**，市场没有原地升级。
 
@@ -114,6 +118,8 @@ Host 按需拉起**唯一**一个通知进程，展示期间保持常驻，空�
 ## English summary
 
 A DSH plugin that shows topmost desktop cards (bottom-right) for task completion, approval requests and agent questions on Windows. It draws its own WinForms window instead of using the Windows notification center, never steals keyboard focus, and offers click-to-open-conversation, bundled sounds and a full settings page. Requires Windows 10/11 and DSH `>= 0.2.1-rc.3`. MIT licensed.
+
+Early development: options and behaviour may change, including breaking changes. Provided "as is", without warranty of any kind.
 
 ## License
 
