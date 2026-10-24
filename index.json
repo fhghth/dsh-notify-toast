@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "title": {
+    "en": "DSH Notify Toast",
+    "zh": "DSH 桌面通知弹窗"
+  },
+  "description": {
+    "en": "Community plugin index for DSH desktop add-ons.",
+    "zh": "DSH 桌面插件索引。"
+  },
+  "metadata": {
+    "categories": {
+      "interface": {
+        "title": {
+          "en": "Interface",
+          "zh": "界面"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "@local/dsh-notify-toast",
+      "title": {
+        "en": "Desktop Notifications",
+        "zh": "桌面弹窗通知"
+      },
+      "description": {
+        "en": "Topmost cards in the screen's bottom-right corner when a task finishes, an approval is requested or the agent asks a question. No Windows notification center, never steals focus, click to open the conversation.",
+        "zh": "任务完成、需要权限审批或 Agent 提问时，在屏幕右下角弹出置顶卡片。不走 Windows 通知中心，不抢焦点，点击可跳回会话。"
+      },
+      "icon": "icon.svg",
+      "author": "fhghth",
+      "homepage": "https://github.com/fhghth/dsh-notify-toast",
+      "repository": {
+        "url": "https://github.com/fhghth/dsh-notify-toast"
+      },
+      "metadata": {
+        "category": "interface",
+        "keywords": [
+          "notification",
+          "toast",
+          "windows",
+          "desktop",
+          "approval"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishTimestamp": 1792861200,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/fhghth/dsh-notify-toast",
+            "commit": "dc1c0d478074fa2b3c36769591ad18f806ea56c1"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3"
+          }
+        }
+      ]
+    }
+  ]
+}
