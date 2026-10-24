@@ -47,12 +47,12 @@
       },
       "versions": [
         {
-          "version": "1.0.0",
-          "publishTimestamp": 1792861200,
+          "version": "1.0.1",
+          "publishTimestamp": 1792838526,
           "source": {
             "type": "git",
             "url": "https://github.com/fhghth/dsh-notify-toast",
-            "commit": "dc1c0d478074fa2b3c36769591ad18f806ea56c1"
+            "commit": "3fd5b91a41a52ddd56ef02ab2a9da058aecc5316"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
