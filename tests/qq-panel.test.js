@@ -19,7 +19,7 @@ import {
   formatCardHeader,
   migrateQQState,
   panelSignature,
-  selectDeletedSubscriptions,
+  selectStaleSubscriptions,
   stateBadge,
   PANEL_DESC_LIMIT,
   PANEL_ITEM_LIMIT,
@@ -67,7 +67,7 @@ test('migrateQQState: drops alias-only entries left by the /ls side effect', () 
   })
   assert.equal(migrated.version, 3)
   assert.deepEqual(Object.keys(migrated.subscriptions), ['s1'])
-  assert.deepEqual(migrated.subscriptions.s1, { alias: 1, since: 10, title: '' })
+  assert.deepEqual(migrated.subscriptions.s1, { alias: 1, since: 10, lastLiveAt: 0, title: '' })
   assert.deepEqual(migrated.learnedOpenids, ['u1'])
   assert.equal(migrated.panelId, 'p1')
 })
@@ -102,16 +102,25 @@ test('migrateQQState: tolerates garbage and old shapes', () => {
   assert.equal(legacy.subscriptions.a.alias, 1)
 })
 
-test('selectDeletedSubscriptions: only ids missing from the store are pruned', () => {
-  assert.deepEqual(
-    selectDeletedSubscriptions(['a', 'b', 'c'], ['a', 'c']),
-    ['b'],
-  )
-  assert.deepEqual(selectDeletedSubscriptions(['a'], new Set(['a'])), [])
-  // An unreadable/empty store must never wipe every subscription.
-  assert.deepEqual(selectDeletedSubscriptions(['a', 'b'], []), [])
-  assert.deepEqual(selectDeletedSubscriptions(['a'], undefined), [])
-  assert.deepEqual(selectDeletedSubscriptions(undefined, ['a']), [])
+test('selectStaleSubscriptions: only cold subscriptions past the TTL are retired', () => {
+  const day = 86_400_000
+  const now = 100 * day
+  const rows = [
+    { sessionId: 'live-old', live: true, lastLiveAt: now - 40 * day },
+    { sessionId: 'cold-old', live: false, lastLiveAt: now - 40 * day },
+    { sessionId: 'cold-new', live: false, lastLiveAt: now - day },
+    { sessionId: 'cold-legacy', live: false, since: now - 31 * day },
+    { sessionId: 'cold-unknown', live: false },
+  ]
+  assert.deepEqual(selectStaleSubscriptions(rows, now, 30 * day), ['cold-old', 'cold-legacy'])
+})
+
+test('selectStaleSubscriptions: a zero TTL disables the sweep entirely', () => {
+  const rows = [{ sessionId: 'a', live: false, lastLiveAt: 1 }]
+  assert.deepEqual(selectStaleSubscriptions(rows, 1e12, 0), [])
+  assert.deepEqual(selectStaleSubscriptions(rows, 1e12, -5), [])
+  assert.deepEqual(selectStaleSubscriptions(undefined, 1e12, 86_400_000), [])
+  assert.deepEqual(selectStaleSubscriptions([null, {}], 1e12, 86_400_000), [])
 })
 
 // ── card header ────────────────────────────────────────────────────────────

@@ -217,6 +217,7 @@ export function migrateQQState(raw) {
           ? fromTable
           : 0,
       since: Number(entry.since) > 0 ? Number(entry.since) : 0,
+      lastLiveAt: Number(entry.lastLiveAt) > 0 ? Number(entry.lastLiveAt) : 0,
       title: typeof entry.title === 'string' ? entry.title : '',
     })
   }
@@ -227,7 +228,12 @@ export function migrateQQState(raw) {
     let alias = item.alias
     if (alias <= 0 || used.has(alias)) alias = allocateAlias(used)
     used.add(alias)
-    subscriptions[item.sessionId] = { alias, since: item.since, title: item.title }
+    subscriptions[item.sessionId] = {
+      alias,
+      since: item.since,
+      lastLiveAt: item.lastLiveAt,
+      title: item.title,
+    }
   }
 
   return {
@@ -241,22 +247,33 @@ export function migrateQQState(raw) {
 }
 
 /**
- * Subscriptions whose session log is no longer on disk.
+ * Subscriptions that have been cold for longer than the TTL.
  *
- * Deletion has no trustworthy event: `session/disposed` also fires when a
- * session merely leaves the in-memory store, so pruning on it would wipe every
- * subscription on each restart. The session directory is the ground truth.
+ * DSH has no "delete session" action — a session can only be archived, and
+ * deleting a workspace explicitly keeps its sessions. So a subscription never
+ * needs to be retired because its session vanished; it is retired because
+ * nobody touched it for long enough. That keeps the plugin free of any
+ * assumption about the session store layout.
  *
- * An empty `existingIds` means the store could not be read, and pruning on an
- * unreadable store would be catastrophic — so it prunes nothing.
+ * A row whose timestamp is unknown is kept: silently dropping a subscription
+ * is worse than keeping a stale one for another day.
  *
- * @param {Iterable<string>} subscriptionIds
- * @param {Iterable<string>} existingIds session ids found under the session root
+ * @param {Array<{ sessionId: string, live?: boolean, lastLiveAt?: number, since?: number }>} rows
+ * @param {number} now
+ * @param {number} ttlMs  0 or less disables the sweep entirely
  */
-export function selectDeletedSubscriptions(subscriptionIds, existingIds) {
-  const existing = existingIds instanceof Set ? existingIds : new Set(existingIds ?? [])
-  if (existing.size === 0) return []
-  return [...(subscriptionIds ?? [])].filter((sessionId) => sessionId && !existing.has(sessionId))
+export function selectStaleSubscriptions(rows, now, ttlMs) {
+  if (!(Number(ttlMs) > 0)) return []
+  const cutoff = Number(now) - Number(ttlMs)
+  const out = []
+  for (const row of rows ?? []) {
+    if (!row || !row.sessionId || row.live === true) continue
+    const lastLiveAt = Number(row.lastLiveAt) > 0 ? Number(row.lastLiveAt) : 0
+    const since = Number(row.since) > 0 ? Number(row.since) : 0
+    const stamp = lastLiveAt || since
+    if (stamp > 0 && stamp < cutoff) out.push(row.sessionId)
+  }
+  return out
 }
 
 /** Cheap change detector so unchanged boards are never re-pushed. */

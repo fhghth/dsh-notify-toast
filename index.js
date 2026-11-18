@@ -3,7 +3,7 @@
  * process over NDJSON, and relays "user clicked a card" to the page over SSE.
  */
 import path from 'node:path'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -15,7 +15,7 @@ import {
   formatCardHeader,
   migrateQQState,
   panelSignature,
-  selectDeletedSubscriptions,
+  selectStaleSubscriptions,
   stateBadge,
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
@@ -174,6 +174,7 @@ const DEFAULTS = {
   qqAnswerQuestions: false,
   qqAutoResume: false,
   qqPanelEnabled: true,
+  qqSubscriptionTtlDays: 30,
 }
 
 const BOOL_KEYS = [
@@ -187,15 +188,13 @@ const BOOL_KEYS = [
 // restart, delivering to one always resumes it.
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
-  'settleMs', 'minIntervalMs', 'idleExitMs', 'qqMinIntervalMs',
+  'settleMs', 'minIntervalMs', 'idleExitMs', 'qqMinIntervalMs', 'qqSubscriptionTtlDays',
 ]
 
 /** QQ channel runtime files live outside the bundle, next to the user's home. */
 const QQ_DATA_DIR = path.join(homedir(), '.dsh-notify-toast')
 const QQ_STATE_FILE = path.join(QQ_DATA_DIR, 'state.json')
 const QQ_LOCK_FILE = path.join(QQ_DATA_DIR, 'qqbot.lock')
-/** `<root>/<workspace>/session-<uuid>/session.v4.jsonl.zstd` — deletion removes the dir. */
-const SESSION_ROOT = path.join(homedir(), '.dsh', 'sessions')
 
 /** A passive reply anchor is only usable for 60 minutes and 4 replies. */
 const PASSIVE_WINDOW_MS = 55 * 60 * 1000
@@ -646,6 +645,7 @@ export function apply(ctx, rawConfig) {
       qqSubscriptions.set(sessionId, {
         alias,
         since: Date.now(),
+        lastLiveAt: Date.now(),
         title: agent && agent.session ? safeTitle(agent.session) : '',
       })
       persistQQStateSoon()
@@ -799,7 +799,7 @@ export function apply(ctx, rawConfig) {
     bot.on('state', (state) => {
       setQQStatus(state.state, state.detail)
       if (state.state === 'ready') {
-        pruneDeletedSubscriptions()
+        pruneStaleSubscriptions()
         schedulePanelSync(1500)
       }
       if (state.state === 'fatal') {
@@ -967,46 +967,47 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Session ids that still have a log directory under the session root.
+   * Retire subscriptions that have been cold for longer than the TTL.
    *
-   * Read-only and cached: a deletion has no trustworthy event (see the
-   * `session/disposed` note below), so the directory itself is the record.
+   * DSH never deletes a session (it can only be archived, and deleting a
+   * workspace keeps every session), so there is nothing to reconcile against
+   * the store. A subscription outlives its usefulness long before the file
+   * does, and a time-based sweep needs no assumption about DSH's layout.
    */
-  let diskScan = { at: 0, ids: new Set() }
-  function sessionIdsOnDisk() {
-    if (Date.now() - diskScan.at < 60_000) return diskScan.ids
-    const ids = new Set()
-    try {
-      for (const workspace of readdirSync(SESSION_ROOT, { withFileTypes: true })) {
-        if (!workspace.isDirectory()) continue
-        const dir = path.join(SESSION_ROOT, workspace.name)
-        let entries = []
-        try {
-          entries = readdirSync(dir, { withFileTypes: true })
-        } catch {
-          continue
-        }
-        for (const entry of entries) {
-          if (entry.isDirectory() && entry.name.startsWith('session-')) ids.add(entry.name)
-        }
-      }
-    } catch {}
-    diskScan = { at: Date.now(), ids }
-    return ids
-  }
-
-  /** Drop subscriptions whose session was deleted from the store. */
-  function pruneDeletedSubscriptions() {
-    const gone = selectDeletedSubscriptions([...qqSubscriptions.keys()], sessionIdsOnDisk())
-    if (gone.length === 0) return
-    for (const sessionId of gone) {
+  function pruneStaleSubscriptions(now = Date.now()) {
+    const days = Math.max(0, Number(cfg().qqSubscriptionTtlDays) || 0)
+    const rows = [...qqSubscriptions].map(([sessionId, entry]) => ({
+      sessionId,
+      live: isSessionLive(sessionId),
+      lastLiveAt: entry.lastLiveAt,
+      since: entry.since,
+    }))
+    const stale = selectStaleSubscriptions(rows, now, days * 86_400_000)
+    if (stale.length === 0) return
+    for (const sessionId of stale) {
       qqSubscriptions.delete(sessionId)
       releaseParkedDecision(sessionId)
       sessionStates.delete(sessionId)
     }
     persistQQStateSoon()
     schedulePanelSync()
-    log('pruned subscriptions for deleted sessions', gone.length)
+    log('retired stale subscriptions', stale.length)
+  }
+
+  /** One cheap liveness probe that does not rebuild the whole board. */
+  function isSessionLive(sessionId) {
+    const agents = agentsOf()
+    return Boolean(agents && typeof agents.get === 'function' && agents.get(sessionId))
+  }
+
+  /** Remember that a subscription was confirmed alive, at most hourly. */
+  function touchSubscription(sessionId) {
+    const entry = qqSubscriptions.get(sessionId)
+    if (!entry) return
+    const now = Date.now()
+    if (now - (entry.lastLiveAt || 0) < 3_600_000) return
+    entry.lastLiveAt = now
+    persistQQStateSoon()
   }
 
   function schedulePanelSync(delay = PANEL_SYNC_DEBOUNCE_MS) {
@@ -1022,9 +1023,6 @@ export function apply(ctx, rawConfig) {
   async function syncPanel() {
     if (!qq || qqStatus.state !== 'ready') return
     if (!cfg().qqPanelEnabled) return
-    // A session deleted straight off disk has no event at all (DSH only ever
-    // archives), so the board refresh doubles as the reconciliation pass.
-    pruneDeletedSubscriptions()
     const targets = qqTargets()
     if (targets.length === 0) return
 
@@ -1389,6 +1387,7 @@ export function apply(ctx, rawConfig) {
       const agent = live.get(sessionId)
       let title = entry.title || ''
       if (agent && agent.session) {
+        touchSubscription(sessionId)
         const fresh = safeTitle(agent.session)
         if (fresh && fresh !== entry.title) {
           entry.title = fresh
@@ -1430,7 +1429,7 @@ export function apply(ctx, rawConfig) {
 
   async function handleList(message) {
     // Looking at the list is the natural moment to reconcile it with the store.
-    pruneDeletedSubscriptions()
+    pruneStaleSubscriptions()
     schedulePanelSync()
     const rows = qqVisibleSessions()
     if (rows.length === 0) {
@@ -1679,9 +1678,6 @@ export function apply(ctx, rawConfig) {
   try {
     ctx.on('session/disposed', (payload) => {
       forgetSession(sessionIdOf(payload))
-      // A real deletion removes the session directory; a session that merely
-      // went cold keeps it, so this is safe to run here.
-      pruneDeletedSubscriptions()
     })
   } catch (error) {
     log('cannot listen to session/disposed', error)
@@ -1710,6 +1706,7 @@ export function apply(ctx, rawConfig) {
       const pending = settleTimers.get(session.id)
       if (pending) { cancel(pending); settleTimers.delete(session.id) }
       markSessionState(session.id, 'running')
+      touchSubscription(session.id)
       return
     }
 
@@ -2198,7 +2195,7 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => {
     loadQQState()
     backfillTitles()
-    pruneDeletedSubscriptions()
+    pruneStaleSubscriptions()
     startQQBridge()
     return () => {
       stopQQBridge()
@@ -2208,6 +2205,23 @@ export function apply(ctx, rawConfig) {
       }
       flushQQState()
     }
+  })
+
+  // Subscriptions that nobody touches for weeks are retired, not because the
+  // session disappeared but because the switch was forgotten.
+  ctx.effect(() => {
+    const SWEEP_MS = 6 * 60 * 60 * 1000
+    let timer = null
+    const tick = () => {
+      try {
+        pruneStaleSubscriptions()
+      } catch (error) {
+        log('subscription sweep failed', error)
+      }
+      timer = later(tick, SWEEP_MS)
+    }
+    timer = later(tick, SWEEP_MS)
+    return () => { if (timer) cancel(timer) }
   })
 
   // ---- lifecycle ----------------------------------------------------------
