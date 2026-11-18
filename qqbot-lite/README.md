@@ -99,14 +99,21 @@ node --test "tests/**/*.test.js"
 
 ## 探针（P0）
 
-真实链路验证，三步各自给结论：
+真实链路验证，三步各自给结论。**openid 是按机器人隔离的**，所以新机器人第一次不知道自己的 openid：`all` 会先连网关收一条消息、自动发现 openid，再验证主动消息。
 
 ```bash
-node tools/probe.js token     # 凭据是否有效
-node tools/probe.js send      # 主动消息是否可用（会真的发一条）
-node tools/probe.js listen    # 网关能否收到消息（发一句话给机器人）
-node tools/probe.js all       # 依次执行三步
+# 推荐第一次这样跑：token → 收消息（顺带发现 openid）→ 主动消息
+node tools/probe.js all
+
+# 已经知道 openid 时
+node tools/probe.js token
+node tools/probe.js send --openid <openid>
+node tools/probe.js listen          # 只验证收消息
 ```
+
+- `token`：凭据是否有效，返回 token 长度和预计过期时间
+- `listen`：网关能否就绪并收到私聊消息；收到后会**用 msg_id 被动回复一条**，从而验证被动窗口
+- `send`：主动消息是否可用（会真的发一条）；失败时按错误码给出结论
 
 凭据来源：`--app-id/--secret/--openid`、环境变量 `QQBOT_APPID/QQBOT_SECRET/QQBOT_OPENID`，或 `tools/probe.config.json`（已 gitignore）。
 

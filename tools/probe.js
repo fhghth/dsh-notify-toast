@@ -5,11 +5,15 @@
  * Three independent checks, each with an unambiguous verdict:
  *   token  : AppID/AppSecret → access_token
  *            proves the credentials and the token endpoint agree
+ *   listen : connect the gateway, wait for one C2C message, answer it inside
+ *            the passive window (msg_id) and print the sender openid
  *   send   : proactive markdown to one openid
  *            proves the bot may push without an inbound message (or tells you
  *            exactly why it may not: 40034105 / 40054013 / 40054004 / 40034100)
- *   listen : connect the gateway and wait for one C2C message, then answer it
- *            inside the passive window (msg_id), proving both directions
+ *
+ * The openid is per bot, so a fresh bot cannot know it in advance. Running
+ * `all` without --openid therefore listens first and uses the discovered
+ * openid for the proactive send.
  *
  * Credentials come from flags, environment or tools/probe.config.json:
  *   --app-id / QQBOT_APPID
@@ -19,8 +23,8 @@
  *
  * Examples:
  *   node tools/probe.js token
- *   node tools/probe.js send --text "通知通道测试"
- *   node tools/probe.js all
+ *   node tools/probe.js all                  # 自动发现 openid 再验证主动消息
+ *   node tools/probe.js send --openid <id>
  *   node tools/probe.js all --base-url http://127.0.0.1:PORT   # offline
  */
 
@@ -68,7 +72,7 @@ function usage() {
 选项:
   --app-id <id>      机器人 AppID（或 QQBOT_APPID）
   --secret <secret>  机器人 AppSecret（或 QQBOT_SECRET）
-  --openid <openid>  接收通知的 QQ 用户 openid（或 QQBOT_OPENID）
+  --openid <openid>  接收通知的 QQ 用户 openid（或 QQBOT_OPENID）；all 可省略，自动发现
   --base-url <url>   OpenAPI 根地址，默认 https://api.bot.qq.com
   --text <text>      send 步骤的正文
   --timeout <秒>     listen 步骤等待时长，默认 120
@@ -98,6 +102,7 @@ function loadConfig(args) {
     baseUrl: args.baseUrl ?? env.QQBOT_BASE_URL ?? fromFile.baseUrl ?? undefined,
     text: args.text ?? fromFile.text ?? '【P0 探针】QQ 通知通道测试消息',
     timeout: (Number.isFinite(args.timeout) && args.timeout > 0 ? args.timeout : 120) * 1000,
+    noReply: Boolean(args.noReply),
     configPath: file,
   }
 }
@@ -130,7 +135,7 @@ function explain(error) {
 }
 
 async function stepToken(cfg) {
-  banner('步骤 1/3 · token')
+  banner('步骤 · token')
   console.log(`AppID    : ${cfg.appId}`)
   console.log(`AppSecret: ${mask(cfg.secret)}`)
   console.log(`根地址   : ${cfg.baseUrl ?? 'https://api.bot.qq.com'}`)
@@ -145,8 +150,11 @@ async function stepToken(cfg) {
     const cached = source.peek()
     console.log(`\n[OK] 已取得 access_token（${Date.now() - started}ms）`)
     console.log(`     长度=${token.length} 前缀=${token.slice(0, 6)}…`)
-    if (cached) console.log(`     预计过期：${new Date(cached.expiresAt).toLocaleString()}（已预留 60s 刷新余量）`)
-    return token
+    if (cached) {
+      console.log(
+        `     预计过期：${new Date(cached.expiresAt).toLocaleString()}（已预留 60s 刷新余量）`,
+      )
+    }
   } catch (error) {
     console.error(`\n[FAIL] ${error instanceof TokenError ? error.message : error}`)
     explain(error)
@@ -155,7 +163,7 @@ async function stepToken(cfg) {
 }
 
 async function stepSend(cfg) {
-  banner('步骤 2/3 · 主动消息')
+  banner('步骤 · 主动消息')
   if (!cfg.openid) {
     console.error('[FAIL] 缺少 openid：主动消息必须指定接收者（--openid 或 QQBOT_OPENID）')
     process.exit(EXIT_USAGE)
@@ -170,25 +178,26 @@ async function stepSend(cfg) {
   })
   try {
     const result = await bot.sendC2C(cfg.openid, { markdown: cfg.text })
-    console.log(`\n[OK] 主动消息已发出`)
+    console.log('\n[OK] 主动消息已发出')
     console.log(`     message_id = ${result.id ?? '(未返回)'}`)
     console.log(`     timestamp  = ${result.timestamp ?? '(未返回)'}`)
     console.log(`     ref_idx    = ${result.refIdx ?? '(未返回)'}`)
-    console.log('\n结论：主动消息可用。通知通道可以在没有用户消息的情况下推送。')
+    console.log('\n结论：主动消息可用 —— 没有用户消息时也能推送。')
     return true
   } catch (error) {
     console.error(`\n[FAIL] 主动消息发送失败：code=${error?.code ?? '?'} ${error?.message ?? error}`)
     explain(error)
     if (error?.code === 40034105 || error?.code === 40054013) {
       console.error('\n结论：主动消息不可用 → 通知必须走「被动回复窗口」或「互动召回」。')
-      console.error('      方案上仍可行：用户每 60 分钟发一句话即可保留 4 条被动回复预算。')
+      console.error('      方案仍可行：用户每 60 分钟内发一句话，可保留 4 条被动回复预算。')
     }
     process.exit(EXIT_SEND)
   }
 }
 
-async function stepListen(cfg) {
-  banner('步骤 3/3 · 网关收消息')
+/** Connect, wait for one C2C message, answer it passively, return the message. */
+async function runListen(cfg) {
+  banner('步骤 · 网关收消息')
   console.log('正在连接网关，收到一条私聊消息即算通过。')
   console.log('请用手机 QQ 给这个机器人发一句话……\n')
 
@@ -204,73 +213,71 @@ async function stepListen(cfg) {
     },
   })
 
-  let settled = false
-  const finish = (code) => {
-    if (settled) return
-    settled = true
-    bot.stop()
-    process.exit(code)
-  }
+  return await new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      bot.stop()
+      fn(value)
+    }
 
-  bot.on('state', (state) => {
-    if (state.state === 'connecting') console.log('     连接中…')
-    else if (state.state === 'ready') console.log(`     [OK] 网关就绪（session=${state.detail ?? '?'}）`)
-    else if (state.state === 'reconnecting') console.log(`     重连中：${state.detail}`)
-    else if (state.state === 'fatal') {
-      console.error(`     [FAIL] 网关致命错误：${state.detail}`)
-      if (String(state.detail).includes('4014') || String(state.detail).includes('4914')) {
-        console.error('\n>>> intent 无权限或机器人未上线：到 q.qq.com 确认「私聊消息」事件权限，')
-        console.error('    并确认机器人已上线（未上线的机器人只能连沙箱环境）。')
+    bot.on('state', (state) => {
+      if (state.state === 'connecting') console.log('     连接中…')
+      else if (state.state === 'ready') console.log(`     [OK] 网关就绪（session=${state.detail ?? '?'}）`)
+      else if (state.state === 'reconnecting') console.log(`     重连中：${state.detail}`)
+      else if (state.state === 'fatal') {
+        console.error(`     [FAIL] 网关致命错误：${state.detail}`)
+        if (/\b(4014|4914|4915)\b/.test(String(state.detail))) {
+          console.error('\n>>> intent 无权限或机器人未上线：到 q.qq.com 确认「私聊消息」事件权限，')
+          console.error('    并确认机器人已上线（未上线只能连沙箱环境）。')
+        }
+        finish(reject, new Error(`gateway fatal: ${state.detail}`))
       }
-      finish(EXIT_GATEWAY)
-    }
-  })
+    })
 
-  let replied = false
-  bot.on('message', async (message) => {
-    console.log(`\n[OK] 收到消息`)
-    console.log(`     scope     = ${message.scope}`)
-    console.log(`     openid    = ${message.openid ?? message.memberOpenid}`)
-    console.log(`     msg_id    = ${message.msgId}`)
-    console.log(`     event_id  = ${message.eventId}`)
-    console.log(`     内容      = ${message.content}`)
-    if (cfg.openid && message.openid && message.openid !== cfg.openid) {
-      console.warn(`     ⚠ 发送者 openid 与配置不同：配置=${cfg.openid}`)
-    }
+    bot.on('message', async (message) => {
+      console.log('\n[OK] 收到消息')
+      console.log(`     scope     = ${message.scope}`)
+      console.log(`     openid    = ${message.openid ?? message.memberOpenid}`)
+      console.log(`     msg_id    = ${message.msgId}`)
+      console.log(`     event_id  = ${message.eventId}`)
+      console.log(`     内容      = ${message.content}`)
+      if (cfg.openid && message.openid && message.openid !== cfg.openid) {
+        console.warn(`     ⚠ 发送者 openid 与配置不同：配置=${cfg.openid}`)
+      }
 
-    if (cfg.noReply || replied) {
-      finish(EXIT_OK)
-      return
-    }
-    replied = true
-    try {
-      const result = await bot.sendC2C(message.openid ?? cfg.openid, {
-        markdown: `收到：${message.content.slice(0, 40)}\n（probe 被动回复，msg_id=${message.msgId}）`,
-        msgId: message.msgId,
-      })
-      console.log(`     [OK] 已用被动回复 msg_id 回信，message_id=${result.id ?? '?'}`)
-      console.log('\n结论：收发双向都通，被动回复窗口可用。')
-    } catch (error) {
-      console.error(`     [FAIL] 被动回复失败：code=${error?.code ?? '?'} ${error?.message ?? error}`)
+      const openid = message.openid ?? cfg.openid
+      if (!cfg.noReply && openid) {
+        try {
+          const result = await bot.sendC2C(openid, {
+            markdown: `收到：${message.content.slice(0, 40)}\n（probe 被动回复，msg_id=${message.msgId}）`,
+            msgId: message.msgId,
+          })
+          console.log(`     [OK] 已用被动回复窗口回信，message_id=${result.id ?? '?'}`)
+        } catch (error) {
+          console.error(`     [FAIL] 被动回复失败：code=${error?.code ?? '?'} ${error?.message ?? error}`)
+          explain(error)
+        }
+      }
+      console.log(`\n结论：网关可用，收到的 openid = ${openid}`)
+      console.log(`     之后可以直接用：--openid ${openid}`)
+      finish(resolve, { openid, message })
+    })
+
+    const timer = setTimeout(() => {
+      console.error(`\n[FAIL] ${Math.round(cfg.timeout / 1000)} 秒内没有收到任何消息。`)
+      console.error('排查：机器人是否已添加为好友？发的是私聊（不是群聊）？机器人是否在线？')
+      finish(reject, new Error('listen timeout'))
+    }, cfg.timeout)
+    timer.unref?.()
+
+    bot.start().catch((error) => {
+      console.error(`\n[FAIL] 网关连接失败：${error?.message ?? error}`)
       explain(error)
-    }
-    finish(EXIT_OK)
+      finish(reject, error)
+    })
   })
-
-  setTimeout(() => {
-    console.error(`\n[FAIL] ${Math.round(cfg.timeout / 1000)} 秒内没有收到任何消息。`)
-    console.error('排查：机器人是否已添加为好友？是否给机器人发的是私聊消息（不是群聊）？')
-    console.error('     你也可以用 --openid 指定自己，确认消息确实从自己的 QQ 发出。')
-    finish(EXIT_GATEWAY)
-  }, cfg.timeout).unref?.()
-
-  try {
-    await bot.start()
-  } catch (error) {
-    console.error(`\n[FAIL] 网关连接失败：${error?.message ?? error}`)
-    explain(error)
-    finish(EXIT_GATEWAY)
-  }
 }
 
 async function main() {
@@ -293,7 +300,7 @@ async function main() {
   }
 
   const cfg = loadConfig(args)
-  if (cfg.configPath && existsSync(cfg.configPath) && !args.config) {
+  if (existsSync(cfg.configPath) && !args.config) {
     console.log(`（已读取配置：${cfg.configPath}）`)
   }
   if (!cfg.appId || !cfg.secret) {
@@ -304,12 +311,49 @@ async function main() {
 
   console.log(`步骤: ${args.step}`)
 
-  if (args.step === 'token' || args.step === 'all') await stepToken(cfg)
-  if (args.step === 'send' || args.step === 'all') await stepSend(cfg)
-  if (args.step === 'listen' || args.step === 'all') await stepListen(cfg)
-  if (args.step === 'token' || args.step === 'send') {
+  if (args.step === 'token') {
+    await stepToken(cfg)
     console.log('\n完成。')
+    return
   }
+  if (args.step === 'send') {
+    await stepSend(cfg)
+    console.log('\n完成。')
+    return
+  }
+  if (args.step === 'listen') {
+    try {
+      await runListen(cfg)
+    } catch {
+      process.exit(EXIT_GATEWAY)
+    }
+    return
+  }
+
+  // all: a fresh bot cannot know the openid, so listen first when it is missing.
+  await stepToken(cfg)
+  let openid = cfg.openid
+  if (!openid) {
+    try {
+      const result = await runListen(cfg)
+      openid = result.openid
+    } catch {
+      console.error('\n[FAIL] 未能通过网关收到消息，主动消息这步没有可用的 openid。')
+      process.exit(EXIT_GATEWAY)
+    }
+  } else {
+    await stepSend(cfg)
+    try {
+      await runListen(cfg)
+    } catch {
+      process.exit(EXIT_GATEWAY)
+    }
+  }
+  if (openid && openid !== cfg.openid) {
+    cfg.openid = openid
+    await stepSend(cfg)
+  }
+  console.log('\n完成。')
 }
 
 main().catch((error) => {
