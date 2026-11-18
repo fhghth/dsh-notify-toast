@@ -1022,6 +1022,9 @@ export function apply(ctx, rawConfig) {
   async function syncPanel() {
     if (!qq || qqStatus.state !== 'ready') return
     if (!cfg().qqPanelEnabled) return
+    // A session deleted straight off disk has no event at all (DSH only ever
+    // archives), so the board refresh doubles as the reconciliation pass.
+    pruneDeletedSubscriptions()
     const targets = qqTargets()
     if (targets.length === 0) return
 
