@@ -130,6 +130,7 @@ window.__ModuleLoader__.load({
           { key: 'qqMinIntervalMs', label: 'QQ 同会话最小间隔（毫秒）', type: 'number' },
           { key: 'qqAnswerApprovals', label: '在 QQ 上回答审批', type: 'bool', hint: '开启后：本会话的审批会发到 QQ 等待回复，桌面不再弹出审批框' },
           { key: 'qqAnswerQuestions', label: '在 QQ 上回答提问', type: 'bool', hint: '开启后：本会话的 Agent 提问同样转到 QQ' },
+          { key: 'qqAutoResume', label: '自动唤醒冷会话', type: 'bool', hint: '在 QQ 里向未打开的会话发消息时，自动把它唤醒（会在 DSH 中变成打开状态）' },
         ],
       },
     ]

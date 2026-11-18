@@ -150,3 +150,73 @@ export function selectPendingDecision({ approvals, questions, refIdx, text }) {
   if (!payload) return undefined
   return { kind, entry, payload }
 }
+
+/**
+ * Parse a `/command` line from QQ.
+ *
+ * @param {string} text
+ * @returns {{ command: 'ls' | 'status' | 'off' | 'help', alias?: number } | undefined}
+ */
+export function parseCommand(text) {
+  const value = String(text ?? '').trim()
+  if (!value.startsWith('/')) return undefined
+  const [rawName, ...rest] = value.slice(1).split(/\s+/)
+  const name = rawName.toLowerCase()
+  const argument = rest.join(' ').trim()
+  if (name === 'ls' || name === 'list') return { command: 'ls' }
+  if (name === 'status') return { command: 'status' }
+  if (name === 'off') {
+    const alias = argument ? Number(argument) : undefined
+    return { command: 'off', alias: Number.isInteger(alias) ? alias : undefined }
+  }
+  return { command: 'help' }
+}
+
+/**
+ * Full inbound routing decision.
+ *
+ * Order: slash command, parked decision, quoted notification card, `#alias`
+ * session message, then nothing (the caller answers with help). The session
+ * branch is what P4 adds on top of the P2 answer routing.
+ *
+ * @param {object} input
+ * @param {Iterable<any>} input.approvals
+ * @param {Iterable<any>} input.questions
+ * @param {Map<string, string>} [input.sentCards] ref_idx -> sessionId for notification cards we sent
+ * @param {Map<number, string>} [input.aliasSessions] alias -> sessionId
+ * @param {string} [input.refIdx]
+ * @param {string} input.text
+ * @returns {
+ *   | { kind: 'command', command: string, alias?: number }
+ *   | { kind: 'decision', decision: { kind: 'approval' | 'question', entry: any, payload: string } }
+ *   | { kind: 'session', sessionId: string, payload: string }
+ *   | { kind: 'error', message: string }
+ *   | undefined
+ * }
+ */
+export function selectInboundRoute({ approvals, questions, sentCards, aliasSessions, refIdx, text }) {
+  const value = String(text ?? '').trim()
+  if (!value) return undefined
+
+  const command = parseCommand(value)
+  if (command) return { kind: 'command', ...command }
+
+  const decision = selectPendingDecision({ approvals, questions, refIdx, text: value })
+  if (decision) return { kind: 'decision', decision }
+
+  if (refIdx && sentCards && sentCards.has(refIdx)) {
+    return { kind: 'session', sessionId: sentCards.get(refIdx), payload: value }
+  }
+
+  const prefixed = value.match(/^#(\d+)\s*([\s\S]*)$/)
+  if (prefixed) {
+    const alias = Number(prefixed[1])
+    const payload = prefixed[2].trim()
+    const sessionId = aliasSessions ? aliasSessions.get(alias) : undefined
+    if (!sessionId) return { kind: 'error', message: `没有 #${alias} 这个会话，发送 /ls 查看` }
+    if (!payload) return { kind: 'error', message: `请在 #${alias} 后面写上要发送的内容` }
+    return { kind: 'session', sessionId, payload }
+  }
+
+  return undefined
+}

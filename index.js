@@ -13,7 +13,7 @@ import {
   extractRefIdx,
   parseApprovalOutcome,
   parseQuestionAnswer,
-  selectPendingDecision,
+  selectInboundRoute,
 } from './qq-answer.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -59,6 +59,45 @@ async function loadSchemaLib() {
 }
 
 const z = await loadSchemaLib()
+
+/**
+ * Load `createUserMessage` from the harness package.
+ *
+ * A `link:` install cannot resolve bare dsh specifiers from its own real path,
+ * so resolve the package through the Host entry script (same trick as the
+ * schema library above) and import the exact ESM file the Host uses — both
+ * sides then share one module instance.
+ *
+ * @returns {Promise<(input: { content: any[], source: object }) => any>}
+ */
+let createUserMessageFactory = null
+async function loadCreateUserMessage() {
+  if (createUserMessageFactory) return createUserMessageFactory
+  const bases = []
+  try { if (process.argv[1]) bases.push(process.argv[1]) } catch {}
+  try {
+    if (process.env.DSH_INSTALL_DIR) bases.push(path.join(process.env.DSH_INSTALL_DIR, 'index.js'))
+  } catch {}
+  bases.push(fileURLToPath(import.meta.url))
+  for (const base of bases) {
+    try {
+      const req = createRequire(base)
+      const pkgPath = req.resolve('@deepseek-ai/dsh-llm/package.json')
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+      const exported = pkg.exports && pkg.exports['.']
+      const entry = typeof exported === 'string' ? exported : exported && (exported.import || exported.default)
+      if (!entry) continue
+      const url = pathToFileURL(path.join(path.dirname(pkgPath), entry)).href
+      const mod = await import(url)
+      const fn = mod.createUserMessage ?? (mod.default && mod.default.createUserMessage)
+      if (typeof fn === 'function') {
+        createUserMessageFactory = fn
+        return fn
+      }
+    } catch {}
+  }
+  throw new Error('无法加载 @deepseek-ai/dsh-llm 的 createUserMessage')
+}
 
 export const inject = ['subprocess', 'sessions', 'webServer']
 
@@ -122,13 +161,14 @@ const DEFAULTS = {
   qqMinIntervalMs: 30000,
   qqAnswerApprovals: false,
   qqAnswerQuestions: false,
+  qqAutoResume: false,
 }
 
 const BOOL_KEYS = [
   'enabled', 'notifyOnComplete', 'notifyOnApproval', 'notifyOnQuestion', 'notifyOnError',
   'soundEnabled', 'showElapsed', 'clickToOpenSession', 'debug',
   'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
-  'qqAnswerApprovals', 'qqAnswerQuestions',
+  'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume',
 ]
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
@@ -438,13 +478,30 @@ export function apply(ctx, rawConfig) {
   const qqSubscriptions = new Map()
   const lastQQFired = new Map()
   let qqAliasSeq = 0
+  /** sessionId -> alias. Independent from subscriptions: an alias makes a session addressable, the switch makes it notify. */
+  const qqAliases = new Map()
+  /** ref_idx of a notification card -> the session it describes (for quoted-reply routing). */
+  const sentCards = new Map()
   /** openids learned from inbound messages (fallback when config is empty). */
   let qqLearned = []
   let qqStateTimer = null
   let qqLockHeld = false
 
+  const MAX_SENT_CARDS = 200
+
+  function rememberSentCard(refIdx, sessionId) {
+    if (!refIdx || !sessionId) return
+    sentCards.delete(refIdx)
+    sentCards.set(refIdx, sessionId)
+    if (sentCards.size > MAX_SENT_CARDS) {
+      const oldest = sentCards.keys().next().value
+      if (oldest !== undefined) sentCards.delete(oldest)
+    }
+  }
+
   function loadQQState() {
     qqSubscriptions.clear()
+    qqAliases.clear()
     qqAliasSeq = 0
     qqLearned = []
     try {
@@ -459,6 +516,19 @@ export function apply(ctx, rawConfig) {
         })
       }
       qqAliasSeq = Number(data?.aliasSeq) > 0 ? Number(data.aliasSeq) : 0
+      const aliases = data && typeof data.aliases === 'object' ? data.aliases : {}
+      for (const [sessionId, alias] of Object.entries(aliases)) {
+        const value = Number(alias)
+        if (!sessionId || !Number.isInteger(value) || value <= 0) continue
+        qqAliases.set(sessionId, value)
+        qqAliasSeq = Math.max(qqAliasSeq, value)
+      }
+      // Sessions subscribed before aliases were split out keep their number.
+      for (const [sessionId, entry] of qqSubscriptions) {
+        if (qqAliases.has(sessionId) || entry.alias <= 0) continue
+        qqAliases.set(sessionId, entry.alias)
+        qqAliasSeq = Math.max(qqAliasSeq, entry.alias)
+      }
       qqLearned = Array.isArray(data?.learnedOpenids)
         ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
         : []
@@ -475,9 +545,10 @@ export function apply(ctx, rawConfig) {
         subscriptions[sessionId] = { on: true, alias: value.alias, since: value.since }
       }
       const payload = {
-        version: 1,
+        version: 2,
         aliasSeq: qqAliasSeq,
         subscriptions,
+        aliases: Object.fromEntries(qqAliases),
         learnedOpenids: qqLearned,
       }
       const temporary = `${QQ_STATE_FILE}.${process.pid}.tmp`
@@ -496,17 +567,26 @@ export function apply(ctx, rawConfig) {
     }, 300)
   }
 
+  /** Assign a stable routing alias (never reused) to one session. */
+  function ensureAlias(sessionId) {
+    const existing = qqAliases.get(sessionId)
+    if (existing) return existing
+    qqAliasSeq += 1
+    qqAliases.set(sessionId, qqAliasSeq)
+    persistQQStateSoon()
+    return qqAliasSeq
+  }
+
   function subscribeQQ(sessionId, enabled) {
     if (enabled) {
-      const previous = qqSubscriptions.get(sessionId)
-      if (previous) return previous.alias
-      qqAliasSeq += 1
-      qqSubscriptions.set(sessionId, { alias: qqAliasSeq, since: Date.now() })
+      const alias = ensureAlias(sessionId)
+      if (qqSubscriptions.has(sessionId)) return alias
+      qqSubscriptions.set(sessionId, { alias, since: Date.now() })
       persistQQStateSoon()
-      return qqAliasSeq
+      return alias
     }
     if (qqSubscriptions.delete(sessionId)) persistQQStateSoon()
-    return 0
+    return qqAliases.get(sessionId) ?? 0
   }
 
   function qqGlobalState() {
@@ -523,7 +603,7 @@ export function apply(ctx, rawConfig) {
 
   function qqSessionState(sessionId) {
     const entry = qqSubscriptions.get(sessionId)
-    return { sessionId, on: Boolean(entry), alias: entry ? entry.alias : 0 }
+    return { sessionId, on: Boolean(entry), alias: qqAliases.get(sessionId) ?? 0 }
   }
 
   /** Configured openids, or whoever talked to the bot first. */
@@ -652,7 +732,7 @@ export function apply(ctx, rawConfig) {
   }
 
   /** Send one programmatic card to every target. */
-  async function notifyQQ({ headline, title, cwd, elapsed, detail }) {
+  async function notifyQQ({ sessionId, headline, title, cwd, elapsed, detail }) {
     if (!qq || qqStatus.state !== 'ready') return
     const targets = qqTargets()
     if (targets.length === 0) {
@@ -666,7 +746,9 @@ export function apply(ctx, rawConfig) {
     const markdown = lines.join('\n')
     for (const openid of targets) {
       try {
-        await qq.bot.sendC2C(openid, { markdown })
+        const sent = await qq.bot.sendC2C(openid, { markdown })
+        // Quoting this card later routes the reply back to the same session.
+        if (sent && sent.refIdx) rememberSentCard(sent.refIdx, sessionId)
       } catch (error) {
         console.warn('[notify-toast] QQ 通知发送失败:', error && error.message ? error.message : error)
       }
@@ -903,22 +985,205 @@ export function apply(ctx, rawConfig) {
    *
    * @returns true when the message was consumed.
    */
+  // ---- QQ -> DSH session routing (P4) -------------------------------------
+
+  /** Sessions owned by the dsh-qqbot conversation bot: never a valid target. */
+  let qqOwnedCache = { at: 0, ids: new Set() }
+  function qqOwnedSessionIds() {
+    if (Date.now() - qqOwnedCache.at < 10_000) return qqOwnedCache.ids
+    const ids = new Set()
+    try {
+      const file = path.join(homedir(), '.dsh-qqbot', 'model-prefs.json')
+      if (existsSync(file)) {
+        const data = JSON.parse(readFileSync(file, 'utf8'))
+        for (const sessionId of Object.values(data?.sessionIds ?? {})) {
+          if (typeof sessionId === 'string' && sessionId) ids.add(sessionId)
+        }
+      }
+    } catch {}
+    qqOwnedCache = { at: Date.now(), ids }
+    return ids
+  }
+
+  /** Live, addressable sessions with their titles and stable aliases. */
+  function listRoutableSessions() {
+    const agents = ctx.agents && typeof ctx.agents.list === 'function' ? ctx.agents.list() : []
+    const excluded = qqOwnedSessionIds()
+    const rows = []
+    for (const agent of agents) {
+      const session = agent && agent.session
+      if (!session || !session.id) continue
+      if (session.header && session.header.origin === 'subagent') continue
+      if (excluded.has(session.id)) continue
+      rows.push({
+        sessionId: session.id,
+        alias: ensureAlias(session.id),
+        title: titleOf(session),
+        running: agent.status === 'running',
+        subscribed: qqSubscriptions.has(session.id),
+      })
+    }
+    rows.sort((a, b) => a.alias - b.alias)
+    return rows
+  }
+
+  function aliasToSessionMap() {
+    const map = new Map()
+    for (const [sessionId, alias] of qqAliases) map.set(alias, sessionId)
+    return map
+  }
+
+  const HELP_TEXT = [
+    '**QQ 通知机器人**',
+    '/ls 列出可投递的会话',
+    '#3 内容 发送到会话 #3',
+    '/off 3 取消会话 #3 的 QQ 通知',
+    '/status 通道状态',
+    '审批 / 提问：直接回 ok / no / 编号，或引用那张卡片回复',
+  ].join('\n')
+
+  async function handleList(message) {
+    const rows = listRoutableSessions()
+    if (rows.length === 0) {
+      await replyQQ(message.openid, message.msgId, '当前没有可投递的会话（它们可能都没打开）。')
+      return
+    }
+    const lines = ['**DSH 会话**']
+    for (const row of rows) {
+      lines.push(`#${row.alias} ${row.running ? '▶' : '·'} ${row.title}${row.subscribed ? ' 🔔' : ''}`)
+    }
+    lines.push('', '发送 **#别名 + 内容** 投递到该会话')
+    await replyQQ(message.openid, message.msgId, lines.join('\n'))
+  }
+
+  async function handleStatus(message) {
+    const aliases = [...qqAliases.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([, alias]) => `#${alias}`)
+      .join(' ')
+    const lines = [
+      '**QQ 通道**',
+      `状态：${qqStatus.state}${qqStatus.detail ? ' · ' + qqStatus.detail : ''}`,
+      `订阅：${qqSubscriptions.size} 个会话`,
+      `待处理决策：${pendingApprovals.size + pendingQuestions.size}`,
+      `别名：${aliases || '（无，发送 /ls 分配）'}`,
+    ]
+    await replyQQ(message.openid, message.msgId, lines.join('\n'))
+  }
+
+  async function handleOff(command, message) {
+    if (!command.alias) {
+      await replyQQ(message.openid, message.msgId, '用法：/off 3（取消会话 #3 的 QQ 通知）')
+      return
+    }
+    const sessionId = aliasToSessionMap().get(command.alias)
+    if (!sessionId) {
+      await replyQQ(message.openid, message.msgId, `没有 #${command.alias} 这个会话，发送 /ls 查看`)
+      return
+    }
+    subscribeQQ(sessionId, false)
+    broadcast({ type: 'qq-subscription', sessionId, on: false, alias: command.alias })
+    await replyQQ(message.openid, message.msgId, `已取消 #${command.alias} 的 QQ 通知（别名仍可用于投递）`)
+  }
+
+  async function handleCommand(command, message) {
+    if (command.command === 'ls') return handleList(message)
+    if (command.command === 'status') return handleStatus(message)
+    if (command.command === 'off') return handleOff(command, message)
+    return replyQQ(message.openid, message.msgId, HELP_TEXT)
+  }
+
+  /**
+   * Deliver one QQ message into a DSH session.
+   *
+   * Uses the same `followup(createUserMessage(...))` entry the conversation
+   * plugin uses, so the message lands in the session's inbox and the agent
+   * picks it up at the next step boundary. Cold sessions are refused unless
+   * `qqAutoResume` is on (resuming wakes an agent the user may not expect).
+   */
+  async function deliverToSession(sessionId, text, message) {
+    const alias = qqAliases.get(sessionId) ?? 0
+    let agent = ctx.agents.get(sessionId)
+    if (!agent) {
+      if (!cfg().qqAutoResume) {
+        await replyQQ(
+          message.openid,
+          message.msgId,
+          `会话 #${alias} 当前没有打开（没有活动 agent）。请先在 DSH 打开它，或在设置里开启「自动唤醒冷会话」。`,
+        )
+        return
+      }
+      try {
+        const handle = await ctx.agents.resume({ resumeSessionId: sessionId })
+        agent = handle.agent
+      } catch (error) {
+        await replyQQ(
+          message.openid,
+          message.msgId,
+          `无法唤醒会话 #${alias}：${error && error.message ? error.message : error}`,
+        )
+        return
+      }
+    }
+    try {
+      const createUserMessage = await loadCreateUserMessage()
+      agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `✅ 已投递到 #${alias}${agent.status === 'running' ? '（会话忙，已排队）' : ''}`,
+      )
+    } catch (error) {
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `投递失败（#${alias}）：${error && error.message ? error.message : error}`,
+      )
+    }
+  }
+
+  /**
+   * Route one inbound message.
+   *
+   * Order: slash command -> parked approval/question -> quoted notification
+   * card -> `#alias` session message -> help. The decision branch is P2; the
+   * session branch is P4.
+   *
+   * @returns true when the message was consumed.
+   */
   async function routeInbound(message) {
     const openid = message.openid ?? message.memberOpenid
     if (!isAllowedSender(openid)) return false
     const text = String(message.content ?? '').trim()
     if (!text) return false
 
-    const target = selectPendingDecision({
+    const route = selectInboundRoute({
       approvals: pendingApprovals.values(),
       questions: pendingQuestions.values(),
+      sentCards,
+      aliasSessions: aliasToSessionMap(),
       refIdx: extractRefIdx(message.raw),
       text,
     })
-    if (!target) return false
+    if (!route) return false
 
-    await answerPending(target, target.payload, message)
-    return true
+    if (route.kind === 'decision') {
+      await answerPending(route.decision, route.decision.payload, message)
+      return true
+    }
+    if (route.kind === 'command') {
+      await handleCommand(route, message)
+      return true
+    }
+    if (route.kind === 'session') {
+      await deliverToSession(route.sessionId, route.payload, message)
+      return true
+    }
+    if (route.kind === 'error') {
+      await replyQQ(message.openid, message.msgId, route.message)
+      return true
+    }
+    return false
   }
 
   ctx.on('approval/request', async (req, next) => {
@@ -988,6 +1253,7 @@ export function apply(ctx, rawConfig) {
       )
       if (qqNotify) {
         void notifyQQ({
+          sessionId,
           headline: '🔒 **需要权限审批**',
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
@@ -1054,6 +1320,7 @@ export function apply(ctx, rawConfig) {
         lastQQFired.set(sessionId, now)
         const error = reason === 'error' && event.data && event.data.reason ? event.data.reason.error : undefined
         void notifyQQ({
+          sessionId,
           headline: reason === 'completed'
             ? '✅ **会话完成**'
             : reason === 'blocked'
@@ -1110,6 +1377,7 @@ export function apply(ctx, rawConfig) {
         )
         if (qqNotify) {
           void notifyQQ({
+            sessionId: exec.agent.id,
             headline: '❓ **需要你回答**',
             title: session ? titleOf(session) : '新对话',
             detail: (preview ? `问题：${preview}\n` : '') + '（请回 DSH 回答；可在设置里开启「在 QQ 上回答提问」）',
