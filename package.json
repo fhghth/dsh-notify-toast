@@ -36,6 +36,8 @@
     "notifier/ui.cs",
     "notifier/notifier.ps1",
     "notifier/demo.json",
+    "qqbot-lite/*.js",
+    "qqbot-lite/README.md",
     "sounds/*.wav",
     "cordis.patch.yml",
     "locale/*.json",
@@ -43,6 +45,9 @@
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\""
+  },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": { "platform": "web", "immediately": true }

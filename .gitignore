@@ -6,3 +6,6 @@ settings-dump*.json
 .sound-originals/
 .DS_Store
 Thumbs.db
+
+# Local probe credentials (copy tools/probe.config.example.json)
+tools/probe.config.json
