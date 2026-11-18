@@ -4,6 +4,7 @@
  * Composition of three protocol pieces:
  *   token.js   -> POST /app/getAppAccessToken (cached, refresh 60s early)
  *   api.js     -> POST /v2/users/{openid}/messages (passive / recall / proactive)
+ *   panel.js   -> /v2/panels (the native 指令面板 board)
  *   gateway.js -> GET /gateway + WebSocket (hello/identify/heartbeat/resume)
  *
  * Deliberately NOT included (the official SDK covers these, we do not need them):
@@ -20,9 +21,11 @@
 
 import { createTokenSource } from './token.js'
 import { createApi, QQBotApiError, MsgType } from './api.js'
+import { createPanelApi, isPanelGone, PANEL_MAX_ITEMS, PANEL_GONE_CODE } from './panel.js'
 import { createGateway, GatewayError, GatewayOp, Intents, planCloseRecovery } from './gateway.js'
 
 export { createTokenSource, createApi, createGateway, Intents, MsgType, GatewayOp, planCloseRecovery, QQBotApiError, GatewayError }
+export { createPanelApi, isPanelGone, PANEL_MAX_ITEMS, PANEL_GONE_CODE }
 export { TokenError } from './token.js'
 
 /** Dispatches that are interesting to a notification bot but are not messages. */
@@ -65,6 +68,7 @@ export function createQQBotLite(options) {
 
   const tokenSource = createTokenSource({ appId, clientSecret, baseUrl, fetchImpl })
   const api = createApi({ tokenSource, baseUrl, fetchImpl })
+  const panels = createPanelApi(api.request)
 
   /** @type {Map<string, Set<Function>>} */
   const listeners = new Map()
@@ -137,6 +141,8 @@ export function createQQBotLite(options) {
     sendC2C: api.sendC2C,
     sendGroup: api.sendGroup,
     sendWakeup: api.sendWakeup,
+    request: api.request,
+    panels,
     getToken: tokenSource.getToken,
     get ready() {
       return gateway.ready

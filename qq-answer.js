@@ -152,19 +152,45 @@ export function selectPendingDecision({ approvals, questions, refIdx, text }) {
 }
 
 /**
+ * A bare command line, as QQ's 指令面板 inserts it.
+ *
+ * The platform stores a `type=command` item name without the leading slash and
+ * drops that exact text into the input box, so every panel tap arrives as
+ * `s 3` instead of `/s 3`. Only a whole-message match is accepted — never a
+ * prefix — so ordinary chat text can never be mistaken for a command.
+ */
+const BARE_COMMAND = /^(s|show|ls|list|status|off|help)(?:\s+(\d+))?$/i
+
+/**
  * Parse a `/command` line from QQ.
  *
+ * `/s 3` (also `/show 3`, and the slashless `s 3` a 指令面板 entry produces) is
+ * what the panel inserts, so the panel can be the navigation surface without
+ * needing any push message.
+ *
  * @param {string} text
- * @returns {{ command: 'ls' | 'status' | 'off' | 'help', alias?: number } | undefined}
+ * @returns {{ command: 'ls' | 'status' | 'off' | 's' | 'help', alias?: number } | undefined}
  */
 export function parseCommand(text) {
   const value = String(text ?? '').trim()
-  if (!value.startsWith('/')) return undefined
-  const [rawName, ...rest] = value.slice(1).split(/\s+/)
+  if (!value) return undefined
+  let body
+  if (value.startsWith('/')) {
+    body = value.slice(1)
+  } else if (BARE_COMMAND.test(value)) {
+    body = value
+  } else {
+    return undefined
+  }
+  const [rawName, ...rest] = body.split(/\s+/)
   const name = rawName.toLowerCase()
   const argument = rest.join(' ').trim()
   if (name === 'ls' || name === 'list') return { command: 'ls' }
   if (name === 'status') return { command: 'status' }
+  if (name === 'show' || name === 's') {
+    const alias = Number(argument)
+    return { command: 's', alias: Number.isInteger(alias) && alias > 0 ? alias : undefined }
+  }
   if (name === 'off') {
     const alias = argument ? Number(argument) : undefined
     return { command: 'off', alias: Number.isInteger(alias) ? alias : undefined }

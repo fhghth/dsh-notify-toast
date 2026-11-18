@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-notify-toast",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Windows desktop popup cards for DSH task completion, approval requests and agent questions",
   "license": "MIT",
   "author": "fhghth",
@@ -33,6 +33,8 @@
   "files": [
     "index.js",
     "client.js",
+    "qq-answer.js",
+    "qq-panel.js",
     "notifier/ui.cs",
     "notifier/notifier.ps1",
     "notifier/demo.json",

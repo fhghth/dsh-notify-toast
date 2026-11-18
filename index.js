@@ -8,7 +8,15 @@ import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { createQQBotLite } from './qqbot-lite/index.js'
+import { createQQBotLite, isPanelGone } from './qqbot-lite/index.js'
+import {
+  buildPanelItems,
+  formatCardHeader,
+  panelSignature,
+  stateBadge,
+  PANEL_ITEM_LIMIT,
+  PANEL_REMARK,
+} from './qq-panel.js'
 import {
   extractRefIdx,
   parseApprovalOutcome,
@@ -162,13 +170,14 @@ const DEFAULTS = {
   qqAnswerApprovals: false,
   qqAnswerQuestions: false,
   qqAutoResume: false,
+  qqPanelEnabled: true,
 }
 
 const BOOL_KEYS = [
   'enabled', 'notifyOnComplete', 'notifyOnApproval', 'notifyOnQuestion', 'notifyOnError',
   'soundEnabled', 'showElapsed', 'clickToOpenSession', 'debug',
   'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
-  'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume',
+  'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume', 'qqPanelEnabled',
 ]
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
@@ -179,6 +188,20 @@ const NUM_KEYS = [
 const QQ_DATA_DIR = path.join(homedir(), '.dsh-notify-toast')
 const QQ_STATE_FILE = path.join(QQ_DATA_DIR, 'state.json')
 const QQ_LOCK_FILE = path.join(QQ_DATA_DIR, 'qqbot.lock')
+
+/** A passive reply anchor is only usable for 60 minutes and 4 replies. */
+const PASSIVE_WINDOW_MS = 55 * 60 * 1000
+const PASSIVE_MAX_REPLIES = 4
+/**
+ * Proactive-send failures that a passive reply can still rescue: no permission
+ * for proactive messages, proactive rate limit, and the user turning active
+ * sends off. Anything else (network, auth) would just fail twice.
+ */
+const FALLBACK_CODES = new Set([40034100, 40034105, 40054013])
+/** Panel writes are 10 QPM, so never push them closer than this. */
+const PANEL_WRITE_GAP_MS = 7000
+/** Coalesce bursts of session events into one panel refresh. */
+const PANEL_SYNC_DEBOUNCE_MS = 4000
 
 function schema() {
   if (!z) return undefined
@@ -222,6 +245,14 @@ function fmtDuration(seconds) {
   if (m < 60) return s === 0 ? m + ' 分钟' : m + ' 分 ' + s + ' 秒'
   const h = Math.floor(m / 60)
   return h + ' 小时 ' + (m % 60) + ' 分'
+}
+
+/** "12 秒" / "3 分钟" — how long ago a status was last touched. */
+function fmtRelative(ms) {
+  const seconds = Math.max(0, Math.round(Number(ms) / 1000))
+  if (seconds < 60) return seconds + ' 秒'
+  if (seconds < 3600) return Math.round(seconds / 60) + ' 分钟'
+  return Math.round(seconds / 3600) + ' 小时'
 }
 
 /**
@@ -457,6 +488,17 @@ export function apply(ctx, rawConfig) {
     return '新对话'
   }
 
+  /**
+   * Stable anchor for one session: `#3 · 修复登录超时`.
+   *
+   * One QQ conversation carries every session, so the alias belongs in the
+   * first line of every card. Without it a wall of notifications is anonymous
+   * and the only way back is scrolling.
+   */
+  function cardHeader(emoji, sessionId, title, suffix) {
+    return formatCardHeader(emoji, qqAliases.get(sessionId) ?? 0, title, suffix)
+  }
+
   function broadcast(payload) {
     const data = 'data: ' + JSON.stringify(payload) + '\n\n'
     for (const response of sseClients) {
@@ -487,6 +529,19 @@ export function apply(ctx, rawConfig) {
   let qqStateTimer = null
   let qqLockHeld = false
 
+  /**
+   * sessionId -> { state, at }. Memory only: after a reload the state is
+   * recomputed from the live agent list plus the parked-decision maps.
+   */
+  const sessionStates = new Map()
+  /** openid -> { msgId, at, used } — the freshest passive-reply anchor. */
+  const inboundAnchors = new Map()
+  /** The single c2c 指令面板 that doubles as the session board. */
+  let qqPanelId = ''
+  let qqPanelTimer = null
+  let qqPanelSignature = ''
+  let qqPanelLastWrite = 0
+
   const MAX_SENT_CARDS = 200
 
   function rememberSentCard(refIdx, sessionId) {
@@ -504,6 +559,7 @@ export function apply(ctx, rawConfig) {
     qqAliases.clear()
     qqAliasSeq = 0
     qqLearned = []
+    qqPanelId = ''
     try {
       if (!existsSync(QQ_STATE_FILE)) return
       const data = JSON.parse(readFileSync(QQ_STATE_FILE, 'utf8'))
@@ -532,6 +588,7 @@ export function apply(ctx, rawConfig) {
       qqLearned = Array.isArray(data?.learnedOpenids)
         ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
         : []
+      qqPanelId = typeof data?.panelId === 'string' ? data.panelId : ''
     } catch (error) {
       log('qq state load failed', error)
     }
@@ -550,6 +607,7 @@ export function apply(ctx, rawConfig) {
         subscriptions,
         aliases: Object.fromEntries(qqAliases),
         learnedOpenids: qqLearned,
+        panelId: qqPanelId,
       }
       const temporary = `${QQ_STATE_FILE}.${process.pid}.tmp`
       writeFileSync(temporary, JSON.stringify(payload, null, 2), 'utf8')
@@ -654,6 +712,11 @@ export function apply(ctx, rawConfig) {
   }
 
   function stopQQBridge() {
+    if (qqPanelTimer) {
+      cancel(qqPanelTimer)
+      qqPanelTimer = null
+    }
+    qqPanelSignature = ''
     if (qq) {
       try { qq.stop() } catch (error) { log('qq stop failed', error) }
       qq = null
@@ -692,6 +755,7 @@ export function apply(ctx, rawConfig) {
 
     bot.on('state', (state) => {
       setQQStatus(state.state, state.detail)
+      if (state.state === 'ready') schedulePanelSync(1500)
       if (state.state === 'fatal') {
         console.error('[notify-toast] QQ 网关致命错误:', state.detail)
       }
@@ -701,6 +765,7 @@ export function apply(ctx, rawConfig) {
     // consumed here; anything else gets the connection guide.
     bot.on('message', async (message) => {
       const openid = message.openid ?? message.memberOpenid
+      rememberInboundAnchor(message)
       if (openid && !qqLearned.includes(openid)) {
         qqLearned.push(openid)
         persistQQStateSoon()
@@ -708,18 +773,15 @@ export function apply(ctx, rawConfig) {
       }
       if (!openid || !message.msgId) return
       if (await routeInbound(message)) return
-      try {
-        await bot.sendC2C(openid, {
-          markdown: [
-            '**通知机器人已连接**',
-            '在 DSH 会话标题栏点 **QQ** 图标，即可让该会话把通知转发到这里。',
-            '（当前版本只支持通知与审批/提问回复，暂不支持发消息给会话）',
-          ].join('\n'),
-          msgId: message.msgId,
-        })
-      } catch (error) {
-        log('qq reply failed', error && error.message ? error.message : error)
-      }
+      await replyQQ(
+        openid,
+        message.msgId,
+        [
+          '**通知机器人已连接**',
+          '在 DSH 会话标题栏点 **QQ** 图标，即可让该会话把通知转发到这里。',
+          '支持：`#别名 内容` 投递、`/s 别名` 查看状态、`/ls` 列出会话。',
+        ].join('\n'),
+      )
     })
 
     qq = { bot, stop: () => bot.stop() }
@@ -732,27 +794,185 @@ export function apply(ctx, rawConfig) {
   }
 
   /** Send one programmatic card to every target. */
-  async function notifyQQ({ sessionId, headline, title, cwd, elapsed, detail }) {
+  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, detail }) {
     if (!qq || qqStatus.state !== 'ready') return
     const targets = qqTargets()
     if (targets.length === 0) {
       log('qq notify skipped: no target openid')
       return
     }
-    const lines = [headline, `标题：${title}`]
+    const lines = [cardHeader(emoji, sessionId, title, suffix)]
     if (elapsed) lines.push(`用时：${elapsed}`)
     if (cwd) lines.push(`目录：${cwd}`)
     if (detail) lines.push(detail)
     const markdown = lines.join('\n')
     for (const openid of targets) {
       try {
-        const sent = await qq.bot.sendC2C(openid, { markdown })
-        // Quoting this card later routes the reply back to the same session.
-        if (sent && sent.refIdx) rememberSentCard(sent.refIdx, sessionId)
+        await sendCard(openid, { markdown, sessionId })
       } catch (error) {
         console.warn('[notify-toast] QQ 通知发送失败:', error && error.message ? error.message : error)
       }
     }
+  }
+
+  // ---- QQ delivery: proactive first, passive only as a fallback -----------
+  //
+  // The two message classes have very different budgets. A passive reply costs
+  // 1 of 4 slots on one `msg_id` and dies 60 minutes after that message, while
+  // a proactive message is 20/min per user and 1000/day. So proactive is the
+  // default path and the passive anchor only rescues bots that never got the
+  // "单聊主动消息" permission on the open platform.
+
+  function rememberInboundAnchor(message) {
+    const openid = message?.openid ?? message?.memberOpenid
+    if (!openid || !message?.msgId) return
+    inboundAnchors.set(openid, { msgId: message.msgId, at: Date.now(), used: 0 })
+  }
+
+  /** The freshest still-usable passive anchor, or undefined. */
+  function passiveAnchorFor(openid) {
+    const entry = inboundAnchors.get(openid)
+    if (!entry) return undefined
+    if (Date.now() - entry.at > PASSIVE_WINDOW_MS) return undefined
+    if (entry.used >= PASSIVE_MAX_REPLIES) return undefined
+    return entry
+  }
+
+  /** Send one card, preferring a proactive message over a passive reply. */
+  async function sendCard(openid, { markdown, sessionId }) {
+    if (!qq || !openid || !markdown) return undefined
+    let sent
+    try {
+      sent = await qq.bot.sendC2C(openid, { markdown })
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : undefined
+      const anchor = FALLBACK_CODES.has(code) ? passiveAnchorFor(openid) : undefined
+      if (!anchor) throw error
+      log(`qq proactive send rejected (${code}), retrying as a passive reply`)
+      sent = await qq.bot.sendC2C(openid, { markdown, msgId: anchor.msgId })
+      anchor.used += 1
+    }
+    // Quoting this card later routes the reply back to the same session.
+    if (sent && sent.refIdx && sessionId) rememberSentCard(sent.refIdx, sessionId)
+    return sent
+  }
+
+  // ---- 指令面板: the session board ----------------------------------------
+  //
+  // The panel is a native QQ surface outside the transcript, so it can show
+  // "where is #4 now" without spending a single message. This is what keeps
+  // per-session notifications readable: the cards stay in the chat, the board
+  // stays one tap away.
+
+  function markSessionState(sessionId, state) {
+    if (!sessionId) return
+    // Re-insert so the Map stays ordered by recency and can be trimmed.
+    sessionStates.delete(sessionId)
+    sessionStates.set(sessionId, { state, at: Date.now() })
+    while (sessionStates.size > 300) {
+      const oldest = sessionStates.keys().next().value
+      if (oldest === undefined) break
+      sessionStates.delete(oldest)
+    }
+    schedulePanelSync()
+  }
+
+  /** Current state of one session, derived from live signals when possible. */
+  function stateOfSession(sessionId, running) {
+    for (const entry of pendingApprovals.values()) {
+      if (entry.sessionId === sessionId) return 'approval'
+    }
+    for (const entry of pendingQuestions.values()) {
+      if (entry.sessionId === sessionId) return 'question'
+    }
+    if (running) return 'running'
+    const known = sessionStates.get(sessionId)
+    return known ? known.state : 'idle'
+  }
+
+  function panelRows() {
+    return listRoutableSessions().map((row) => ({
+      alias: row.alias,
+      title: row.title,
+      state: stateOfSession(row.sessionId, row.running),
+    }))
+  }
+
+  function schedulePanelSync(delay = PANEL_SYNC_DEBOUNCE_MS) {
+    if (qqPanelTimer) return
+    if (!cfg().qqPanelEnabled) return
+    if (!qq || qqStatus.state !== 'ready') return
+    qqPanelTimer = later(() => {
+      qqPanelTimer = null
+      void syncPanel()
+    }, Math.max(0, delay))
+  }
+
+  async function syncPanel() {
+    if (!qq || qqStatus.state !== 'ready') return
+    if (!cfg().qqPanelEnabled) return
+    const targets = qqTargets()
+    if (targets.length === 0) return
+
+    // Panel writes are 10 QPM; anything closer is deferred, not dropped.
+    const gap = PANEL_WRITE_GAP_MS - (Date.now() - qqPanelLastWrite)
+    if (gap > 0) {
+      schedulePanelSync(gap + 100)
+      return
+    }
+
+    const items = buildPanelItems(panelRows(), { limit: PANEL_ITEM_LIMIT })
+    const signature = panelSignature(items)
+    if (qqPanelId && signature === qqPanelSignature) return
+
+    qqPanelLastWrite = Date.now()
+    try {
+      if (!qqPanelId) {
+        await findOrCreatePanel(targets, items)
+      } else {
+        await qq.bot.panels.update(qqPanelId, { items, remark: PANEL_REMARK })
+        qqPanelSignature = signature
+      }
+      log('qq panel synced', items.length)
+    } catch (error) {
+      if (isPanelGone(error) && qqPanelId) {
+        log('qq panel is gone, recreating')
+        qqPanelId = ''
+        try {
+          await findOrCreatePanel(targets, items)
+        } catch (retry) {
+          log('qq panel recreate failed', retry)
+        }
+        return
+      }
+      log('qq panel sync failed', error && error.message ? error.message : error)
+    }
+  }
+
+  /** Adopt the panel carrying our remark, or create one bound to the targets. */
+  async function findOrCreatePanel(targets, items) {
+    let records = []
+    try {
+      records = await qq.bot.panels.list('c2c')
+    } catch (error) {
+      log('qq panel list failed', error && error.message ? error.message : error)
+    }
+    const existing = records.find(
+      (record) => record && record.panel && record.panel.remark === PANEL_REMARK && record.panel_id,
+    )
+    let id = existing ? existing.panel_id : ''
+    if (!id) {
+      id = await qq.bot.panels.create({
+        scope: 'c2c',
+        targetType: 'specific',
+        userOpenids: targets,
+        panel: { items, remark: PANEL_REMARK },
+      })
+    }
+    qqPanelId = id
+    qqPanelSignature = panelSignature(items)
+    persistQQStateSoon()
+    return id
   }
 
   // ---- QQ answer routing (approvals + questions) --------------------------
@@ -810,8 +1030,8 @@ export function apply(ctx, rawConfig) {
     return undefined
   }
 
-  function approvalCardText(title, request, command) {
-    const lines = ['🔒 **需要权限审批**', `标题：${title}`]
+  function approvalCardText(sessionId, title, request, command) {
+    const lines = [cardHeader('🔒', sessionId, title, '需要权限审批')]
     if (request?.toolName) lines.push(`工具：${request.toolName}`)
     if (command) lines.push('命令：\n```\n' + command + '\n```')
     if (request?.reason) lines.push(`原因：${request.reason}`)
@@ -819,8 +1039,11 @@ export function apply(ctx, rawConfig) {
     return lines.join('\n')
   }
 
-  function questionCardText(title, question, index, total) {
-    const lines = [`❓ **需要你回答**（${index}/${total}）`, `标题：${title}`, `问题：${question.question}`]
+  function questionCardText(sessionId, title, question, index, total) {
+    const lines = [
+      cardHeader('❓', sessionId, title, `需要你回答（${index}/${total}）`),
+      `问题：${question.question}`,
+    ]
     const options = Array.isArray(question.options) ? question.options : []
     if (options.length > 0) {
       lines.push('')
@@ -835,7 +1058,7 @@ export function apply(ctx, rawConfig) {
   }
 
   /** Send one markdown card to every target; returns the ref_idx list, or undefined when nothing went out. */
-  async function sendCardToTargets(markdown) {
+  async function sendCardToTargets(markdown, sessionId) {
     if (!qq || qqStatus.state !== 'ready') return undefined
     const targets = qqTargets()
     if (targets.length === 0) return undefined
@@ -843,7 +1066,7 @@ export function apply(ctx, rawConfig) {
     let delivered = false
     for (const openid of targets) {
       try {
-        const sent = await qq.bot.sendC2C(openid, { markdown })
+        const sent = await sendCard(openid, { markdown, sessionId })
         delivered = true
         if (sent && sent.refIdx) refIds.push(sent.refIdx)
       } catch (error) {
@@ -856,9 +1079,14 @@ export function apply(ctx, rawConfig) {
   async function parkApproval(request) {
     const session = request.agent.session
     const sessionId = session.id
-    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
-    const markdown = approvalCardText(titleOf(session), request, commandOfCall(session, request.callId))
-    const refIds = await sendCardToTargets(markdown)
+    const alias = qqAliases.get(sessionId) ?? 0
+    const markdown = approvalCardText(
+      sessionId,
+      titleOf(session),
+      request,
+      commandOfCall(session, request.callId),
+    )
+    const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
 
     const entry = { sessionId, alias, request, refIds, resolve: () => {}, onAbort: undefined }
@@ -875,6 +1103,7 @@ export function apply(ctx, rawConfig) {
       request.signal.addEventListener('abort', onAbort, { once: true })
     }
     pendingApprovals.set(sessionId, entry)
+    markSessionState(sessionId, 'approval')
     log(`qq approval parked: session=${sessionId}`)
     return promise
   }
@@ -885,8 +1114,11 @@ export function apply(ctx, rawConfig) {
     const questions = Array.isArray(request.questions) ? request.questions : []
     if (questions.length === 0) return undefined
     const title = titleOf(session)
-    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
-    const refIds = await sendCardToTargets(questionCardText(title, questions[0], 1, questions.length))
+    const alias = qqAliases.get(sessionId) ?? 0
+    const refIds = await sendCardToTargets(
+      questionCardText(sessionId, title, questions[0], 1, questions.length),
+      sessionId,
+    )
     if (!refIds) return undefined
 
     const entry = {
@@ -917,14 +1149,18 @@ export function apply(ctx, rawConfig) {
       request.signal.addEventListener('abort', onAbort, { once: true })
     }
     pendingQuestions.set(sessionId, entry)
+    markSessionState(sessionId, 'question')
     log(`qq question parked: session=${sessionId} count=${questions.length}`)
     return promise
   }
 
+  /** Passive reply anchored on the message we are answering. */
   async function replyQQ(openid, msgId, markdown) {
     if (!qq || !openid || !msgId) return
     try {
       await qq.bot.sendC2C(openid, { markdown, msgId })
+      const entry = inboundAnchors.get(openid)
+      if (entry && entry.msgId === msgId) entry.used += 1
     } catch (error) {
       log('qq ack failed', error && error.message ? error.message : error)
     }
@@ -946,6 +1182,7 @@ export function apply(ctx, rawConfig) {
         entry.request.signal.removeEventListener('abort', entry.onAbort)
       }
       entry.resolve(outcome)
+      markSessionState(entry.sessionId, 'running')
       await replyQQ(
         openid,
         msgId,
@@ -964,7 +1201,10 @@ export function apply(ctx, rawConfig) {
     entry.index += 1
     if (entry.index < entry.request.questions.length) {
       const next = entry.request.questions[entry.index]
-      const refIds = await sendCardToTargets(questionCardText(entry.title, next, entry.index + 1, entry.request.questions.length))
+      const refIds = await sendCardToTargets(
+        questionCardText(entry.sessionId, entry.title, next, entry.index + 1, entry.request.questions.length),
+        entry.sessionId,
+      )
       if (refIds) entry.refIds.push(...refIds)
       await replyQQ(openid, msgId, `✅ 第 ${entry.index} 题已记录（会话 #${entry.alias}），下一题已发送`)
       return
@@ -974,6 +1214,7 @@ export function apply(ctx, rawConfig) {
       entry.request.signal.removeEventListener('abort', entry.onAbort)
     }
     entry.resolve({ answers: entry.collected })
+    markSessionState(entry.sessionId, 'running')
     await replyQQ(openid, msgId, `✅ 已提交全部回答（会话 #${entry.alias}）`)
   }
 
@@ -1046,9 +1287,11 @@ export function apply(ctx, rawConfig) {
   const HELP_TEXT = [
     '**QQ 通知机器人**',
     '/ls 列出可投递的会话',
+    '/s 3 查看会话 #3 的状态',
     '#3 内容 发送到会话 #3',
     '/off 3 取消会话 #3 的 QQ 通知',
     '/status 通道状态',
+    '指令面板里点任意一项，即可直接切到那个会话',
     '审批 / 提问：直接回 ok / no / 编号，或引用那张卡片回复',
   ].join('\n')
 
@@ -1060,9 +1303,44 @@ export function apply(ctx, rawConfig) {
     }
     const lines = ['**DSH 会话**']
     for (const row of rows) {
-      lines.push(`#${row.alias} ${row.running ? '▶' : '·'} ${row.title}${row.subscribed ? ' 🔔' : ''}`)
+      const state = stateOfSession(row.sessionId, row.running)
+      lines.push(`#${row.alias} ${stateBadge(state)} ${row.title}${row.subscribed ? ' 🔔' : ''}`)
     }
-    lines.push('', '发送 **#别名 + 内容** 投递到该会话')
+    lines.push('', '发送 **#别名 + 内容** 投递到该会话；**/s 别名** 查看状态')
+    await replyQQ(message.openid, message.msgId, lines.join('\n'))
+  }
+
+  /** `/s N` — what a 指令面板 entry inserts. Answers with that session's card. */
+  async function handleShow(command, message) {
+    if (!command.alias) {
+      await replyQQ(message.openid, message.msgId, '用法：/s 3（查看会话 #3 的状态）')
+      return
+    }
+    const sessionId = aliasToSessionMap().get(command.alias)
+    if (!sessionId) {
+      await replyQQ(message.openid, message.msgId, `没有 #${command.alias} 这个会话，发送 /ls 查看`)
+      return
+    }
+    const row = listRoutableSessions().find((item) => item.sessionId === sessionId)
+    if (!row) {
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `#${command.alias} 当前没有打开。别名仍然可用（\`#${command.alias} 内容\` 投递），但需要先在 DSH 打开该会话。`,
+      )
+      return
+    }
+    const state = stateOfSession(sessionId, row.running)
+    const known = sessionStates.get(sessionId)
+    const lines = [cardHeader('', sessionId, row.title, '')]
+    lines.push(`状态：${stateBadge(state)}`)
+    if (known && known.at) lines.push(`更新：${fmtRelative(Date.now() - known.at)}前`)
+    lines.push(
+      row.subscribed
+        ? `QQ 通知：🔔 已开启（\`/off ${row.alias}\` 关闭）`
+        : `QQ 通知：已关闭（在 DSH 会话标题栏点 QQ 图标开启）`,
+    )
+    lines.push('', `发送 **#${row.alias} 内容** 可直接投递到该会话`)
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
   }
 
@@ -1076,6 +1354,7 @@ export function apply(ctx, rawConfig) {
       `状态：${qqStatus.state}${qqStatus.detail ? ' · ' + qqStatus.detail : ''}`,
       `订阅：${qqSubscriptions.size} 个会话`,
       `待处理决策：${pendingApprovals.size + pendingQuestions.size}`,
+      `指令面板：${cfg().qqPanelEnabled ? (qqPanelId ? '已同步' : '待创建') : '已关闭'}`,
       `别名：${aliases || '（无，发送 /ls 分配）'}`,
     ]
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
@@ -1099,6 +1378,7 @@ export function apply(ctx, rawConfig) {
   async function handleCommand(command, message) {
     if (command.command === 'ls') return handleList(message)
     if (command.command === 'status') return handleStatus(message)
+    if (command.command === 's') return handleShow(command, message)
     if (command.command === 'off') return handleOff(command, message)
     return replyQQ(message.openid, message.msgId, HELP_TEXT)
   }
@@ -1244,6 +1524,7 @@ export function apply(ctx, rawConfig) {
     if (event.type === 'turn/start') {
       const pending = settleTimers.get(session.id)
       if (pending) { cancel(pending); settleTimers.delete(session.id) }
+      markSessionState(session.id, 'running')
       return
     }
 
@@ -1270,7 +1551,8 @@ export function apply(ctx, rawConfig) {
       if (qqNotify) {
         void notifyQQ({
           sessionId,
-          headline: '🔒 **需要权限审批**',
+          emoji: '🔒',
+          suffix: '需要权限审批',
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
           detail: `工具：${tool}\n（请回 DSH 处理；可在设置里开启「在 QQ 上回答审批」）`,
@@ -1293,6 +1575,21 @@ export function apply(ctx, rawConfig) {
     )
     if (!isDone && !(current.notifyOnError && isBad) && !qqWanted) return
     if (session.header && (session.header.parentSession || session.header.origin === 'subagent')) return
+
+    // The panel is a status board, so it must reflect the turn even when the
+    // card itself is throttled away.
+    markSessionState(
+      sessionId,
+      reason === 'completed'
+        ? 'completed'
+        : reason === 'error'
+          ? 'error'
+          : reason === 'blocked'
+            ? 'blocked'
+            : reason === 'interrupted'
+              ? 'interrupted'
+              : 'idle',
+    )
 
     // Read the turn start from the log as it stands at this very event: process
     // memory is lost on a plugin reload, the durable log is not.
@@ -1335,15 +1632,17 @@ export function apply(ctx, rawConfig) {
         if (now - previousQQ < (Number(current.qqMinIntervalMs) || 0)) return
         lastQQFired.set(sessionId, now)
         const error = reason === 'error' && event.data && event.data.reason ? event.data.reason.error : undefined
+        const badge = reason === 'completed'
+          ? { emoji: '✅', suffix: '会话完成' }
+          : reason === 'blocked'
+            ? { emoji: '⏸', suffix: '已阻塞' }
+            : reason === 'interrupted'
+              ? { emoji: '⏹', suffix: '已中断' }
+              : { emoji: '⚠️', suffix: '任务失败' }
         void notifyQQ({
           sessionId,
-          headline: reason === 'completed'
-            ? '✅ **会话完成**'
-            : reason === 'blocked'
-              ? '⏸ **已阻塞**'
-              : reason === 'interrupted'
-                ? '⏹ **已中断**'
-                : '⚠️ **任务失败**',
+          emoji: badge.emoji,
+          suffix: badge.suffix,
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
           elapsed: elapsedText,
@@ -1394,7 +1693,8 @@ export function apply(ctx, rawConfig) {
         if (qqNotify) {
           void notifyQQ({
             sessionId: exec.agent.id,
-            headline: '❓ **需要你回答**',
+            emoji: '❓',
+            suffix: '需要你回答',
             title: session ? titleOf(session) : '新对话',
             detail: (preview ? `问题：${preview}\n` : '') + '（请回 DSH 回答；可在设置里开启「在 QQ 上回答提问」）',
           })

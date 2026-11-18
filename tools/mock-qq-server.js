@@ -6,6 +6,8 @@
  *   GET  /gateway                      -> { url }
  *   POST /v2/users/:openid/messages    -> message response (or a business error)
  *   POST /v2/groups/:openid/messages   -> same
+ *   GET|POST /v2/panels                -> 指令面板 list / create
+ *   GET|PUT|DELETE /v2/panels/:id      -> 指令面板 detail / update / delete
  *   WS   /gateway                      -> hello / identify / heartbeat / dispatch
  *
  * The WebSocket server is a minimal RFC 6455 implementation (text frames only,
@@ -38,6 +40,7 @@ const OP_PONG = 0xa
  * @param {number} [options.heartbeatInterval] hello heartbeat interval in ms
  * @param {{ code: number, message?: string }} [options.tokenError]
  * @param {{ code: number, message?: string }} [options.sendError]
+ * @param {{ code: number, message?: string }} [options.panelError]
  * @param {string} [options.appId]
  * @param {string} [options.clientSecret]
  * @param {boolean} [options.autoReady] send READY automatically on identify
@@ -47,6 +50,7 @@ export function createMockQQServer(options = {}) {
     heartbeatInterval = 50,
     tokenError,
     sendError,
+    panelError,
     appId = 'mock-app',
     clientSecret = 'mock-secret',
     autoReady = true,
@@ -58,8 +62,11 @@ export function createMockQQServer(options = {}) {
   const frames = []
   /** @type {Set<any>} */
   const sockets = new Set()
+  /** @type {Map<string, any>} panel_id -> record */
+  const panels = new Map()
   let seq = 0
   let messageCounter = 0
+  let panelCounter = 0
   let httpServer
   let baseUrl
 
@@ -116,6 +123,47 @@ export function createMockQQServer(options = {}) {
         timestamp: new Date().toISOString(),
         ext_info: { ref_idx: `REFIDX_${messageCounter}` },
       })
+    }
+
+    // ── 指令面板 ──────────────────────────────────────────────────────────
+    if (url.pathname === '/v2/panels') {
+      if (panelError) return sendJson(res, 200, { code: panelError.code, message: panelError.message })
+      if (req.method === 'GET') {
+        const scope = url.searchParams.get('scope')
+        const records = [...panels.values()].filter((record) => !scope || record.scope === scope)
+        return sendJson(res, 200, { records, next_cursor: '', is_end: true })
+      }
+      if (req.method === 'POST') {
+        panelCounter += 1
+        const id = `panel_${panelCounter}`
+        panels.set(id, {
+          panel_id: id,
+          scope: body?.scope ?? 'c2c',
+          target_type: body?.target_type ?? 'all',
+          panel: body?.panel ?? { items: [] },
+          user_openids: Array.isArray(body?.user_openids) ? body.user_openids : [],
+          version: 1,
+        })
+        return sendJson(res, 200, { panel_id: id })
+      }
+    }
+
+    const panelMatch = url.pathname.match(/^\/v2\/panels\/([^/]+)$/)
+    if (panelMatch) {
+      const id = decodeURIComponent(panelMatch[1])
+      if (panelError) return sendJson(res, 200, { code: panelError.code, message: panelError.message })
+      const record = panels.get(id)
+      if (!record) return sendJson(res, 200, { code: 40030006, message: '指令面板不存在' })
+      if (req.method === 'GET') return sendJson(res, 200, record)
+      if (req.method === 'PUT') {
+        record.panel = { ...(body?.panel ?? record.panel) }
+        record.version += 1
+        return sendJson(res, 200, {})
+      }
+      if (req.method === 'DELETE') {
+        panels.delete(id)
+        return sendJson(res, 200, {})
+      }
     }
 
     return sendJson(res, 404, { code: 404, message: 'not found' })
@@ -327,6 +375,11 @@ export function createMockQQServer(options = {}) {
     },
     requests,
     frames,
+    panels,
+    /** Simulate a panel deleted behind our back. */
+    dropPanel(panelId) {
+      panels.delete(panelId)
+    },
     get sockets() {
       return sockets
     },

@@ -126,19 +126,19 @@ export function createApi(options) {
   /**
    * Send one message.
    *
-   * @param {object} request
-   * @param {'c2c'|'group'} [request.scope]
-   * @param {string} request.targetId              user openid (c2c) or group openid
-   * @param {string} [request.markdown]            markdown body (msg_type=2)
-   * @param {string} [request.content]             plain text body (msg_type=0)
-   * @param {string} [request.msgId]               passive reply anchor
-   * @param {string} [request.eventId]             passive reply anchor (event)
-   * @param {boolean} [request.isWakeup]           interaction-recall message (c2c only)
-   * @param {number} [request.msgSeq]              override; defaults to per-msg_id counter
-   * @param {object} [request.keyboard]            inline keyboard
-   * @param {object} [request.messageReference]    { message_id } quote
+   * @param {object} options
+   * @param {'c2c'|'group'} [options.scope]
+   * @param {string} options.targetId              user openid (c2c) or group openid
+   * @param {string} [options.markdown]            markdown body (msg_type=2)
+   * @param {string} [options.content]             plain text body (msg_type=0)
+   * @param {string} [options.msgId]               passive reply anchor
+   * @param {string} [options.eventId]             passive reply anchor (event)
+   * @param {boolean} [options.isWakeup]           interaction-recall message (c2c only)
+   * @param {number} [options.msgSeq]              override; defaults to per-msg_id counter
+   * @param {object} [options.keyboard]            inline keyboard
+   * @param {object} [options.messageReference]    { message_id } quote
    */
-  async function send(request) {
+  async function send(options) {
     const {
       scope = 'c2c',
       targetId,
@@ -150,7 +150,7 @@ export function createApi(options) {
       msgSeq,
       keyboard,
       messageReference,
-    } = request ?? {}
+    } = options ?? {}
 
     const anchors = [msgId, eventId, isWakeup ? true : undefined].filter((v) => v !== undefined)
     if (anchors.length > 1) {
@@ -187,18 +187,7 @@ export function createApi(options) {
     if (messageReference !== undefined) body.message_reference = messageReference
 
     const path = messagePath(scope, targetId)
-    let token = await tokenSource.getToken()
-    let response = await post(path, body, token)
-
-    // A stale token is the one failure worth a single silent retry.
-    if (response.status === 401) {
-      tokenSource.invalidate()
-      token = await tokenSource.getToken({ force: true })
-      response = await post(path, body, token)
-    }
-
-    const parsed = await readJson(response)
-    assertOk(response.status, parsed)
+    const parsed = await request('POST', path, body)
     return {
       id: parsed?.id,
       timestamp: parsed?.timestamp,
@@ -207,21 +196,42 @@ export function createApi(options) {
     }
   }
 
-  async function post(path, body, token) {
+  /**
+   * One authenticated OpenAPI call. 401 gets a single silent retry with a
+   * forced token refresh, which is the only failure worth repeating.
+   *
+   * @param {'GET'|'POST'|'PUT'|'DELETE'} method
+   * @param {string} path  path including the query string
+   * @param {object} [body]
+   */
+  async function request(method, path, body) {
+    let token = await tokenSource.getToken()
+    let response = await dispatch(method, path, body, token)
+    if (response.status === 401) {
+      tokenSource.invalidate()
+      token = await tokenSource.getToken({ force: true })
+      response = await dispatch(method, path, body, token)
+    }
+    const parsed = await readJson(response)
+    assertOk(response.status, parsed)
+    return parsed
+  }
+
+  async function dispatch(method, path, body, token) {
     try {
       return await fetchImpl(`${baseUrl}${path}`, {
-        method: 'POST',
+        method,
         headers: {
           authorization: `QQBot ${token}`,
           'content-type': 'application/json',
           'user-agent': userAgent,
         },
-        body: JSON.stringify(body),
+        body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (error) {
       throw new QQBotApiError(
-        `发送请求失败：${error instanceof Error ? error.message : String(error)}`,
+        `请求失败(${method} ${path})：${error instanceof Error ? error.message : String(error)}`,
       )
     }
   }
@@ -231,5 +241,5 @@ export function createApi(options) {
   const sendWakeup = (targetId, payload) =>
     send({ ...payload, scope: 'c2c', targetId, isWakeup: true })
 
-  return { send, sendC2C, sendGroup, sendWakeup, nextMsgSeq }
+  return { send, sendC2C, sendGroup, sendWakeup, nextMsgSeq, request }
 }
