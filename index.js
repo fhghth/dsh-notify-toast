@@ -1005,12 +1005,22 @@ export function apply(ctx, rawConfig) {
     return ids
   }
 
+  /** Optional service access: the plugin does not inject `agents`, so never touch ctx.agents directly. */
+  function agentsOf() {
+    try {
+      return ctx.get('agents')
+    } catch {
+      return undefined
+    }
+  }
+
   /** Live, addressable sessions with their titles and stable aliases. */
   function listRoutableSessions() {
-    const agents = ctx.agents && typeof ctx.agents.list === 'function' ? ctx.agents.list() : []
+    const agents = agentsOf()
+    const list = agents && typeof agents.list === 'function' ? agents.list() : []
     const excluded = qqOwnedSessionIds()
     const rows = []
-    for (const agent of agents) {
+    for (const agent of list) {
       const session = agent && agent.session
       if (!session || !session.id) continue
       if (session.header && session.header.origin === 'subagent') continue
@@ -1103,7 +1113,8 @@ export function apply(ctx, rawConfig) {
    */
   async function deliverToSession(sessionId, text, message) {
     const alias = qqAliases.get(sessionId) ?? 0
-    let agent = ctx.agents.get(sessionId)
+    const agents = agentsOf()
+    let agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined
     if (!agent) {
       if (!cfg().qqAutoResume) {
         await replyQQ(
@@ -1113,8 +1124,12 @@ export function apply(ctx, rawConfig) {
         )
         return
       }
+      if (!agents || typeof agents.resume !== 'function') {
+        await replyQQ(message.openid, message.msgId, `无法唤醒会话 #${alias}：agents 服务不可用`)
+        return
+      }
       try {
-        const handle = await ctx.agents.resume({ resumeSessionId: sessionId })
+        const handle = await agents.resume({ resumeSessionId: sessionId })
         agent = handle.agent
       } catch (error) {
         await replyQQ(
