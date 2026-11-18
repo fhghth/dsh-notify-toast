@@ -3,9 +3,12 @@
  * process over NDJSON, and relays "user clicked a card" to the page over SSE.
  */
 import path from 'node:path'
-import { readFileSync, existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { createQQBotLite } from './qqbot-lite/index.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
@@ -102,16 +105,31 @@ const DEFAULTS = {
   clickToOpenSession: true,
   idleExitMs: 900000,
   debug: false,
+
+  // ---- QQ notification channel (optional) --------------------------------
+  qqEnabled: false,
+  qqAppId: '',
+  qqAppSecret: '',
+  qqOpenids: '',
+  qqNotifyOnComplete: true,
+  qqNotifyOnError: true,
+  qqMinIntervalMs: 30000,
 }
 
 const BOOL_KEYS = [
   'enabled', 'notifyOnComplete', 'notifyOnApproval', 'notifyOnQuestion', 'notifyOnError',
   'soundEnabled', 'showElapsed', 'clickToOpenSession', 'debug',
+  'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
 ]
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
-  'settleMs', 'minIntervalMs', 'idleExitMs',
+  'settleMs', 'minIntervalMs', 'idleExitMs', 'qqMinIntervalMs',
 ]
+
+/** QQ channel runtime files live outside the bundle, next to the user's home. */
+const QQ_DATA_DIR = path.join(homedir(), '.dsh-notify-toast')
+const QQ_STATE_FILE = path.join(QQ_DATA_DIR, 'state.json')
+const QQ_LOCK_FILE = path.join(QQ_DATA_DIR, 'qqbot.lock')
 
 function schema() {
   if (!z) return undefined
@@ -397,11 +415,261 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  // ---- QQ channel ---------------------------------------------------------
+  //
+  // The QQ bot is an independent AppID with its own gateway connection, so it
+  // never touches the dsh-qqbot conversation bot. Only sessions whose per
+  // session switch is on push notifications; the switch is stored outside the
+  // bundle so it survives plugin reloads and page refreshes.
+
+  /** @type {{ bot: any, stop: () => void } | null} */
+  let qq = null
+  let qqStatus = { state: 'disabled', detail: '' }
+  /** sessionId -> { alias, since } — presence means "this session forwards". */
+  const qqSubscriptions = new Map()
+  const lastQQFired = new Map()
+  let qqAliasSeq = 0
+  /** openids learned from inbound messages (fallback when config is empty). */
+  let qqLearned = []
+  let qqStateTimer = null
+  let qqLockHeld = false
+
+  function loadQQState() {
+    qqSubscriptions.clear()
+    qqAliasSeq = 0
+    qqLearned = []
+    try {
+      if (!existsSync(QQ_STATE_FILE)) return
+      const data = JSON.parse(readFileSync(QQ_STATE_FILE, 'utf8'))
+      const subscriptions = data && typeof data.subscriptions === 'object' ? data.subscriptions : {}
+      for (const [sessionId, value] of Object.entries(subscriptions)) {
+        if (!sessionId || !value || value.on === false) continue
+        qqSubscriptions.set(sessionId, {
+          alias: Number(value.alias) > 0 ? Number(value.alias) : 0,
+          since: Number(value.since) > 0 ? Number(value.since) : 0,
+        })
+      }
+      qqAliasSeq = Number(data?.aliasSeq) > 0 ? Number(data.aliasSeq) : 0
+      qqLearned = Array.isArray(data?.learnedOpenids)
+        ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
+        : []
+    } catch (error) {
+      log('qq state load failed', error)
+    }
+  }
+
+  function flushQQState() {
+    try {
+      mkdirSync(QQ_DATA_DIR, { recursive: true })
+      const subscriptions = {}
+      for (const [sessionId, value] of qqSubscriptions) {
+        subscriptions[sessionId] = { on: true, alias: value.alias, since: value.since }
+      }
+      const payload = {
+        version: 1,
+        aliasSeq: qqAliasSeq,
+        subscriptions,
+        learnedOpenids: qqLearned,
+      }
+      const temporary = `${QQ_STATE_FILE}.${process.pid}.tmp`
+      writeFileSync(temporary, JSON.stringify(payload, null, 2), 'utf8')
+      renameSync(temporary, QQ_STATE_FILE)
+    } catch (error) {
+      log('qq state write failed', error)
+    }
+  }
+
+  function persistQQStateSoon() {
+    if (qqStateTimer) clearTimeout(qqStateTimer)
+    qqStateTimer = later(() => {
+      qqStateTimer = null
+      flushQQState()
+    }, 300)
+  }
+
+  function subscribeQQ(sessionId, enabled) {
+    if (enabled) {
+      const previous = qqSubscriptions.get(sessionId)
+      if (previous) return previous.alias
+      qqAliasSeq += 1
+      qqSubscriptions.set(sessionId, { alias: qqAliasSeq, since: Date.now() })
+      persistQQStateSoon()
+      return qqAliasSeq
+    }
+    if (qqSubscriptions.delete(sessionId)) persistQQStateSoon()
+    return 0
+  }
+
+  function qqGlobalState() {
+    const current = cfg()
+    return {
+      enabled: Boolean(current.qqEnabled),
+      state: qqStatus.state,
+      detail: qqStatus.detail,
+      connected: qqStatus.state === 'ready',
+      appId: current.qqAppId || '',
+      targets: qqTargets(),
+    }
+  }
+
+  function qqSessionState(sessionId) {
+    const entry = qqSubscriptions.get(sessionId)
+    return { sessionId, on: Boolean(entry), alias: entry ? entry.alias : 0 }
+  }
+
+  /** Configured openids, or whoever talked to the bot first. */
+  function qqTargets() {
+    const configured = String(cfg().qqOpenids ?? '')
+      .split(/[\s,;，；]+/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    return configured.length > 0 ? configured : qqLearned
+  }
+
+  function pidAlive(pid) {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function releaseQQLock() {
+    if (!qqLockHeld) return
+    qqLockHeld = false
+    try { unlinkSync(QQ_LOCK_FILE) } catch { /* already gone */ }
+  }
+
+  /** Only one host process may hold the gateway for one AppID. */
+  function acquireQQLock(appId) {
+    try {
+      if (existsSync(QQ_LOCK_FILE)) {
+        const lock = JSON.parse(readFileSync(QQ_LOCK_FILE, 'utf8'))
+        if (lock && Number(lock.pid) > 0 && lock.pid !== process.pid && pidAlive(Number(lock.pid))) {
+          return { ok: false, reason: `另一个 DSH 进程（pid=${lock.pid}）已占用 appId=${lock.appId ?? '?'} 的通知连接` }
+        }
+      }
+      mkdirSync(QQ_DATA_DIR, { recursive: true })
+      writeFileSync(QQ_LOCK_FILE, JSON.stringify({ pid: process.pid, appId, startedAt: Date.now() }), 'utf8')
+      qqLockHeld = true
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, reason: `无法写入锁文件：${error && error.message ? error.message : error}` }
+    }
+  }
+
+  function setQQStatus(state, detail) {
+    qqStatus = { state, detail: detail ?? '' }
+    broadcast({ type: 'qq-status', ...qqGlobalState() })
+  }
+
+  function stopQQBridge() {
+    if (qq) {
+      try { qq.stop() } catch (error) { log('qq stop failed', error) }
+      qq = null
+    }
+    releaseQQLock()
+    if (qqStatus.state !== 'disabled') setQQStatus('disabled', '')
+  }
+
+  function startQQBridge() {
+    const current = cfg()
+    if (!current.qqEnabled) {
+      setQQStatus('disabled', '')
+      return
+    }
+    if (!current.qqAppId || !current.qqAppSecret) {
+      setQQStatus('unconfigured', '缺少 AppID / AppSecret')
+      return
+    }
+    const lock = acquireQQLock(current.qqAppId)
+    if (!lock.ok) {
+      log('qq bridge locked', lock.reason)
+      setQQStatus('locked', lock.reason)
+      return
+    }
+
+    const bot = createQQBotLite({
+      appId: current.qqAppId,
+      clientSecret: current.qqAppSecret,
+      logger: {
+        info: (message) => log(message),
+        warn: (message) => console.warn('[notify-toast]', message),
+        error: (message) => console.error('[notify-toast]', message),
+        debug: (message) => log(message),
+      },
+    })
+
+    bot.on('state', (state) => {
+      setQQStatus(state.state, state.detail)
+      if (state.state === 'fatal') {
+        console.error('[notify-toast] QQ 网关致命错误:', state.detail)
+      }
+    })
+
+    // P1 has no session routing yet: answer a message with instructions so the
+    // user can tell "the bot is alive" from "the bot is not connected".
+    bot.on('message', async (message) => {
+      const openid = message.openid ?? message.memberOpenid
+      if (openid && !qqLearned.includes(openid)) {
+        qqLearned.push(openid)
+        persistQQStateSoon()
+        broadcast({ type: 'qq-status', ...qqGlobalState() })
+      }
+      if (!openid || !message.msgId) return
+      try {
+        await bot.sendC2C(openid, {
+          markdown: [
+            '**通知机器人已连接**',
+            '在 DSH 会话标题栏点 **QQ** 图标，即可让该会话把通知转发到这里。',
+            '（当前版本只支持通知推送，暂不支持在这里对话）',
+          ].join('\n'),
+          msgId: message.msgId,
+        })
+      } catch (error) {
+        log('qq reply failed', error && error.message ? error.message : error)
+      }
+    })
+
+    qq = { bot, stop: () => bot.stop() }
+    setQQStatus('connecting', '')
+    bot.start().catch((error) => {
+      const message = error && error.message ? error.message : String(error)
+      setQQStatus('error', message)
+      console.error('[notify-toast] QQ 网关启动失败:', message)
+    })
+  }
+
+  /** Send one programmatic card to every target. */
+  async function notifyQQ({ headline, title, cwd, elapsed, detail }) {
+    if (!qq || qqStatus.state !== 'ready') return
+    const targets = qqTargets()
+    if (targets.length === 0) {
+      log('qq notify skipped: no target openid')
+      return
+    }
+    const lines = [headline, `标题：${title}`]
+    if (elapsed) lines.push(`用时：${elapsed}`)
+    if (cwd) lines.push(`目录：${cwd}`)
+    if (detail) lines.push(detail)
+    const markdown = lines.join('\n')
+    for (const openid of targets) {
+      try {
+        await qq.bot.sendC2C(openid, { markdown })
+      } catch (error) {
+        console.warn('[notify-toast] QQ 通知发送失败:', error && error.message ? error.message : error)
+      }
+    }
+  }
+
   // ---- events -------------------------------------------------------------
 
   ctx.on('session/event', (session, event) => {
     const current = cfg()
-    if (!current.enabled) return
+    // `enabled` is the popup master switch; the QQ channel keeps working when
+    // popups are off, as long as its own switch is on.
+    if (!current.enabled && !current.qqEnabled) return
     if (!session || !event) return
 
     if (event.type === 'turn/start') {
@@ -430,40 +698,72 @@ export function apply(ctx, rawConfig) {
     const reason = event.data && event.data.reason ? event.data.reason.kind : undefined
     const isDone = reason === 'completed'
     const isBad = reason === 'error' || reason === 'blocked' || reason === 'interrupted'
-    if (!isDone && !(current.notifyOnError && isBad)) return
+    const sessionId = session.id
+    // Desktop cards and the QQ channel have independent switches: turning the
+    // popup off must not silence the phone, and vice versa.
+    const qqWanted = Boolean(
+      current.qqEnabled
+        && qqSubscriptions.has(sessionId)
+        && (isDone ? current.qqNotifyOnComplete : current.qqNotifyOnError),
+    )
+    if (!isDone && !(current.notifyOnError && isBad) && !qqWanted) return
     if (session.header && (session.header.parentSession || session.header.origin === 'subagent')) return
 
     // Read the turn start from the log as it stands at this very event: process
     // memory is lost on a plugin reload, the durable log is not.
     const startedAt = turnStartTimeOf(session, event.seq)
 
-    const sessionId = session.id
     const existing = settleTimers.get(sessionId)
     if (existing) cancel(existing)
 
     const timer = later(() => {
       settleTimers.delete(sessionId)
       const now = Date.now()
-      const previous = lastFired.get(sessionId) || 0
-      if (now - previous < (Number(current.minIntervalMs) || 0)) return
-      lastFired.set(sessionId, now)
 
       let subtitle = '任务已完成'
       if (reason === 'error') subtitle = '任务失败'
       else if (reason === 'blocked') subtitle = '已阻塞'
       else if (reason === 'interrupted') subtitle = '已中断'
 
+      let elapsedText = ''
       if (reason === 'completed' && current.showElapsed && startedAt) {
-        const seconds = (Date.now() - startedAt) / 1000
-        if (seconds >= 5) subtitle += ' · 用时 ' + fmtDuration(seconds)
+        const seconds = (now - startedAt) / 1000
+        if (seconds >= 5) {
+          elapsedText = fmtDuration(seconds)
+          subtitle += ' · 用时 ' + elapsedText
+        }
       }
 
-      show({
-        kind: reason === 'completed' ? 'complete' : 'error',
-        title: titleOf(session),
-        subtitle,
-        sessionId,
-      })
+      const previous = lastFired.get(sessionId) || 0
+      if (now - previous >= (Number(current.minIntervalMs) || 0)) {
+        lastFired.set(sessionId, now)
+        show({
+          kind: reason === 'completed' ? 'complete' : 'error',
+          title: titleOf(session),
+          subtitle,
+          sessionId,
+        })
+      }
+
+      if (qqWanted) {
+        const previousQQ = lastQQFired.get(sessionId) || 0
+        if (now - previousQQ < (Number(current.qqMinIntervalMs) || 0)) return
+        lastQQFired.set(sessionId, now)
+        const error = reason === 'error' && event.data && event.data.reason ? event.data.reason.error : undefined
+        void notifyQQ({
+          headline: reason === 'completed'
+            ? '✅ **会话完成**'
+            : reason === 'blocked'
+              ? '⏸ **已阻塞**'
+              : reason === 'interrupted'
+                ? '⏹ **已中断**'
+                : '⚠️ **任务失败**',
+          title: titleOf(session),
+          cwd: session.header && session.header.cwd ? session.header.cwd : '',
+          elapsed: elapsedText,
+          detail: error ? `错误：${error.code} ${error.message}` : '',
+        })
+      }
     }, Math.max(0, Number(current.settleMs) || 0))
 
     settleTimers.set(sessionId, timer)
@@ -534,6 +834,92 @@ export function apply(ctx, rawConfig) {
       req.on('close', close)
       res.on('close', close)
       res.on('error', close)
+    },
+  }))
+
+  // ---- QQ channel routes --------------------------------------------------
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-notify/qq/state',
+    handler(req, res) {
+      const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+      const reply = (status, payload) => {
+        try {
+          res.writeHead(status, headers)
+          res.end(JSON.stringify(payload))
+        } catch {}
+      }
+      if (req.method !== 'GET') return reply(405, { ok: false, error: 'method not allowed' })
+      let sessionId = ''
+      try {
+        sessionId = new URL(req.url, 'http://127.0.0.1').searchParams.get('sessionId') || ''
+      } catch {}
+      reply(200, {
+        ok: true,
+        global: qqGlobalState(),
+        session: sessionId ? qqSessionState(sessionId) : null,
+      })
+    },
+  }))
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-notify/qq/subscribe',
+    async handler(req, res) {
+      const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+      const reply = (status, payload) => {
+        try {
+          res.writeHead(status, headers)
+          res.end(JSON.stringify(payload))
+        } catch {}
+      }
+      if (req.method !== 'POST') return reply(405, { ok: false, error: 'method not allowed' })
+      if (!cfg().qqEnabled) return reply(409, { ok: false, error: 'QQ 通知未启用' })
+      try {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        if (!sessionId) return reply(400, { ok: false, error: '缺少 sessionId' })
+        subscribeQQ(sessionId, Boolean(body.enabled))
+        const state = qqSessionState(sessionId)
+        broadcast({ type: 'qq-subscription', ...state })
+        reply(200, { ok: true, ...state })
+      } catch (error) {
+        reply(400, { ok: false, error: String((error && error.message) || error) })
+      }
+    },
+  }))
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-notify/qq/test',
+    async handler(req, res) {
+      const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+      const reply = (status, payload) => {
+        try {
+          res.writeHead(status, headers)
+          res.end(JSON.stringify(payload))
+        } catch {}
+      }
+      if (req.method !== 'POST') return reply(405, { ok: false, error: 'method not allowed' })
+      if (!cfg().qqEnabled) return reply(409, { ok: false, error: 'QQ 通知未启用' })
+      if (!qq || qqStatus.state !== 'ready') {
+        return reply(409, {
+          ok: false,
+          error: `QQ 未连接（${qqStatus.state}${qqStatus.detail ? ': ' + qqStatus.detail : ''}）`,
+        })
+      }
+      const targets = qqTargets()
+      if (targets.length === 0) {
+        return reply(409, { ok: false, error: '还没有接收者 openid：先给机器人发一条消息，或在配置里填写' })
+      }
+      try {
+        const markdown = '🔔 **测试消息**\n来自 DSH 通知插件\n时间：' + new Date().toLocaleString()
+        for (const openid of targets) await qq.bot.sendC2C(openid, { markdown })
+        reply(200, { ok: true, targets: targets.length })
+      } catch (error) {
+        reply(502, { ok: false, error: String((error && error.message) || error) })
+      }
     },
   }))
 
@@ -682,6 +1068,21 @@ export function apply(ctx, rawConfig) {
       }
     },
   }))
+
+  // ---- QQ channel lifecycle -----------------------------------------------
+
+  ctx.effect(() => {
+    loadQQState()
+    startQQBridge()
+    return () => {
+      stopQQBridge()
+      if (qqStateTimer) {
+        cancel(qqStateTimer)
+        qqStateTimer = null
+      }
+      flushQQState()
+    }
+  })
 
   // ---- lifecycle ----------------------------------------------------------
 

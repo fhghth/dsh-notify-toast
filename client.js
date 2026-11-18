@@ -118,6 +118,18 @@ window.__ModuleLoader__.load({
           { key: 'debug', label: '调试日志', type: 'bool' },
         ],
       },
+      {
+        title: 'QQ 通知（可选）',
+        fields: [
+          { key: 'qqEnabled', label: '启用 QQ 通知通道', type: 'bool', hint: '需要在 QQ 开放平台单独创建一个通知机器人' },
+          { key: 'qqAppId', label: '机器人 AppID', type: 'text' },
+          { key: 'qqAppSecret', label: '机器人 AppSecret', type: 'secret', hint: '保存在 profile 配置里，仅本机可见' },
+          { key: 'qqOpenids', label: '接收通知的 openid', type: 'text', hint: '多个用逗号分隔；留空则自动使用第一个给机器人发过消息的人' },
+          { key: 'qqNotifyOnComplete', label: '任务完成时推送到 QQ', type: 'bool' },
+          { key: 'qqNotifyOnError', label: '失败 / 中断时推送到 QQ', type: 'bool' },
+          { key: 'qqMinIntervalMs', label: 'QQ 同会话最小间隔（毫秒）', type: 'number' },
+        ],
+      },
     ]
 
     const styles = {
@@ -209,6 +221,14 @@ window.__ModuleLoader__.load({
             onChange: (event) => onChange(event.target.value),
           }),
         )
+      } else if (field.type === 'secret') {
+        control = el('input', {
+          style: styles.input,
+          type: 'password',
+          autoComplete: 'off',
+          value: value ?? '',
+          onChange: (event) => onChange(event.target.value),
+        })
       } else if (field.options) {
         control = el(
           'select',
@@ -256,12 +276,182 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---- QQ session switch ---------------------------------------------------
+    //
+    // One shared store keeps every open toggle in sync: the SSE bridge pushes
+    // status and subscription changes, and a toggle also reads its own state
+    // once on mount (a page opened later never misses the snapshot).
+
+    const qqStore = {
+      global: null,
+      sessions: new Map(),
+      listeners: new Set(),
+      subscribe(fn) {
+        this.listeners.add(fn)
+        return () => this.listeners.delete(fn)
+      },
+      emit() {
+        for (const fn of [...this.listeners]) {
+          try { fn() } catch {}
+        }
+      },
+      setGlobal(global) {
+        if (!global) return
+        this.global = global
+        this.emit()
+      },
+      setSession(state) {
+        if (!state || !state.sessionId) return
+        this.sessions.set(state.sessionId, state)
+        this.emit()
+      },
+    }
+
+    async function fetchQQState(sessionId) {
+      const query = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : ''
+      const response = await fetch('/dsh-notify/qq/state' + query, { headers: { accept: 'application/json' } })
+      const data = await response.json()
+      if (!data || !data.ok) throw new Error((data && data.error) || 'HTTP ' + response.status)
+      qqStore.setGlobal(data.global)
+      if (data.session) qqStore.setSession(data.session)
+      return data
+    }
+
+    function QQToggle(props) {
+      const sessionId = props && props.sessionId ? props.sessionId : ''
+      const [, bump] = React.useState(0)
+      const [busy, setBusy] = React.useState(false)
+
+      React.useEffect(() => {
+        if (!sessionId) return undefined
+        let alive = true
+        fetchQQState(sessionId).catch(() => {})
+        const off = qqStore.subscribe(() => {
+          if (alive) bump((value) => value + 1)
+        })
+        return () => {
+          alive = false
+          off()
+        }
+      }, [sessionId])
+
+      const global = qqStore.global
+      if (!sessionId || !global || !global.enabled) return null
+
+      const state = qqStore.sessions.get(sessionId)
+      const on = Boolean(state && state.on)
+      const connected = Boolean(global.connected)
+
+      const toggle = async () => {
+        if (busy) return
+        setBusy(true)
+        try {
+          const response = await fetch('/dsh-notify/qq/subscribe', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, enabled: !on }),
+          })
+          const data = await response.json()
+          if (!data || !data.ok) throw new Error((data && data.error) || 'HTTP ' + response.status)
+          qqStore.setSession({ sessionId: data.sessionId, on: data.on, alias: data.alias })
+        } catch (error) {
+          console.warn('[dsh-notify-toast] QQ 开关失败：' + (error && error.message ? error.message : error))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const title = !connected
+        ? 'QQ 通知未连接，请到「设置 → 插件 → 桌面弹窗通知」检查'
+        : on
+          ? '已开启：本会话结束时会推送到 QQ（点击关闭）'
+          : '开启本会话的 QQ 通知'
+
+      return el(
+        'button',
+        {
+          type: 'button',
+          title,
+          'aria-pressed': on,
+          'aria-label': title,
+          disabled: busy,
+          onClick: toggle,
+          style: {
+            height: 26,
+            padding: '0 9px',
+            borderRadius: 13,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: 0.4,
+            cursor: busy ? 'default' : 'pointer',
+            opacity: busy ? 0.6 : 1,
+            border: on
+              ? '0.5px solid var(--dsw-alias-brand-primary, #111)'
+              : '0.5px solid var(--dsw-alias-border-l2, #d9d9d9)',
+            background: on ? 'var(--dsw-alias-brand-primary, #111)' : 'transparent',
+            color: on
+              ? 'var(--dsw-alias-brand-primary-foreground, #fff)'
+              : 'var(--dsw-alias-label-secondary, #666)',
+          },
+        },
+        'QQ',
+        el('span', {
+          style: {
+            width: 6,
+            height: 6,
+            borderRadius: 3,
+            background: connected ? (on ? '#22c55e' : '#9ca3af') : '#f59e0b',
+          },
+        }),
+      )
+    }
+
     function SettingsPage() {
       const [draft, setDraft] = React.useState(null)
       const [revision, setRevision] = React.useState(0)
       const [saving, setSaving] = React.useState(false)
       const [message, setMessage] = React.useState(null)
       const [previewing, setPreviewing] = React.useState('')
+      const [qqStatus, setQQStatus] = React.useState(null)
+      const [testingQQ, setTestingQQ] = React.useState(false)
+
+      const refreshQQStatus = async () => {
+        try {
+          const response = await fetch('/dsh-notify/qq/state', { headers: { accept: 'application/json' } })
+          const data = await response.json()
+          if (data && data.ok) setQQStatus(data.global)
+        } catch {}
+      }
+
+      const testQQ = async () => {
+        setTestingQQ(true)
+        setMessage(null)
+        try {
+          const response = await fetch('/dsh-notify/qq/test', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+          })
+          const data = await response.json()
+          if (!response.ok || !data.ok) throw new Error((data && data.error) || 'HTTP ' + response.status)
+          setMessage({ kind: 'ok', text: `已发送 QQ 测试消息（${data.targets} 个接收者）` })
+        } catch (error) {
+          setMessage({ kind: 'error', text: 'QQ 测试失败：' + error.message })
+        } finally {
+          setTestingQQ(false)
+          void refreshQQStatus()
+        }
+      }
+
+      const qqStatusText = (status) => {
+        if (!status) return 'QQ 通知：读取中…'
+        if (!status.enabled) return 'QQ 通知：未启用'
+        if (status.connected) return 'QQ 通知：已连接 · appId ' + (status.appId || '?')
+        return 'QQ 通知：' + status.state + (status.detail ? ' · ' + status.detail : '')
+      }
 
       const preview = async (kind) => {
         setPreviewing(kind)
@@ -319,6 +509,10 @@ window.__ModuleLoader__.load({
         return () => { alive = false }
       }, [])
 
+      React.useEffect(() => {
+        void refreshQQStatus()
+      }, [])
+
       const setField = (key, value) => setDraft((current) => ({ ...current, [key]: value }))
 
       const save = async () => {
@@ -335,6 +529,7 @@ window.__ModuleLoader__.load({
           setDraft({ ...(data.values || draft) })
           setRevision(Number(data.revision) || revision)
           setMessage({ kind: 'ok', text: '已保存，下一张弹窗即生效' })
+          setTimeout(() => { void refreshQQStatus() }, 1500)
         } catch (error) {
           setMessage({ kind: 'error', text: '保存失败：' + error.message })
         } finally {
@@ -351,6 +546,7 @@ window.__ModuleLoader__.load({
         null,
         el('div', { style: styles.title }, '桌面弹窗通知'),
         el('div', { style: styles.desc }, '任务完成、需要权限审批或 Agent 提问时，在屏幕右下角弹出置顶卡片。改动保存后，下一张卡片即按新配置显示。'),
+        el('div', { style: { ...styles.note, marginBottom: 18 } }, qqStatusText(qqStatus)),
         el(
           'div',
           { style: { ...styles.actions, marginBottom: 22 } },
@@ -401,6 +597,16 @@ window.__ModuleLoader__.load({
             { type: 'button', style: { ...styles.button, opacity: saving ? 0.6 : 1 }, disabled: saving, onClick: save },
             saving ? '保存中…' : '保存',
           ),
+          el(
+            'button',
+            {
+              type: 'button',
+              style: { ...styles.ghost, opacity: testingQQ ? 0.6 : 1 },
+              disabled: testingQQ,
+              onClick: testQQ,
+            },
+            testingQQ ? '发送中…' : '发送 QQ 测试消息',
+          ),
           message
             ? el('span', { style: { ...styles.msg, color: message.kind === 'ok' ? '#16A34A' : '#DC2626' } }, message.text)
             : null,
@@ -432,9 +638,15 @@ window.__ModuleLoader__.load({
             source.onmessage = (event) => {
               try {
                 const data = JSON.parse(event.data)
-                if (data && data.type === 'focus' && data.sessionId) {
+                if (!data) return
+                if (data.type === 'focus' && data.sessionId) {
                   try { window.focus() } catch {}
                   ctx.uiWorkspace.openSession(data.sessionId)
+                } else if (data.type === 'qq-status') {
+                  const { type, ...global } = data
+                  qqStore.setGlobal(global)
+                } else if (data.type === 'qq-subscription') {
+                  qqStore.setSession({ sessionId: data.sessionId, on: data.on, alias: data.alias })
                 }
               } catch {}
             }
@@ -458,6 +670,15 @@ window.__ModuleLoader__.load({
           name: 'plugins.bundle.config',
           key: '@local/dsh-notify-toast',
         }, BundleConfig))
+
+        // Per-session QQ switch in the session header, beside the View tabs.
+        // Rendered only when the global QQ channel is enabled.
+        ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+          name: 'conversation.session.header.utilities',
+          id: 'qq-notify-toggle',
+          order: 120,
+          label: 'QQ 通知',
+        }, QQToggle))
       },
     }
   },
