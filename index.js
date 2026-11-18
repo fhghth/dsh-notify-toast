@@ -1141,12 +1141,13 @@ export function apply(ctx, rawConfig) {
       }
     }
     try {
+      const wasRunning = agent.status === 'running'
       const createUserMessage = await loadCreateUserMessage()
       agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
       await replyQQ(
         message.openid,
         message.msgId,
-        `✅ 已投递到 #${alias}${agent.status === 'running' ? '（会话忙，已排队）' : ''}`,
+        `✅ 已投递到 #${alias}${wasRunning ? '（会话忙，已排队）' : ''}`,
       )
     } catch (error) {
       await replyQQ(
