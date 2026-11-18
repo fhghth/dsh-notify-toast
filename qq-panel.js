@@ -161,6 +161,21 @@ export function buildPanelPayload(rows, options) {
   return { items: buildPanelItems(rows, options), remark: PANEL_REMARK }
 }
 
+/**
+ * Which sessions belong on the board.
+ *
+ * The panel is "what I care about", not a full session list. Turning a
+ * session's QQ switch off removes it, and anything still running stays visible
+ * even with notifications off. `/ls` is the complete list.
+ *
+ * @param {Array<{ subscribed?: boolean, running?: boolean }>} rows
+ */
+export function selectBoardRows(rows) {
+  return (Array.isArray(rows) ? rows : []).filter(
+    (row) => row && (row.subscribed === true || row.running === true),
+  )
+}
+
 /** Cheap change detector so unchanged boards are never re-pushed. */
 export function panelSignature(items) {
   return JSON.stringify(Array.isArray(items) ? items : [])

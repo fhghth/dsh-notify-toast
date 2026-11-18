@@ -17,6 +17,7 @@ import {
   displayWidth,
   formatCardHeader,
   panelSignature,
+  selectBoardRows,
   stateBadge,
   PANEL_DESC_LIMIT,
   PANEL_ITEM_LIMIT,
@@ -43,6 +44,19 @@ function panelApiFor(mock) {
   const api = createApi({ tokenSource, baseUrl: mock.url })
   return createPanelApi(api.request)
 }
+
+test('selectBoardRows: unsubscribed finished sessions leave the board', () => {
+  const rows = [
+    { alias: 1, subscribed: true, running: false },
+    { alias: 4, subscribed: false, running: false },
+    { alias: 5, subscribed: true, running: true },
+    { alias: 6, subscribed: false, running: true },
+  ]
+  assert.deepEqual(selectBoardRows(rows).map((row) => row.alias), [1, 5, 6])
+  assert.deepEqual(selectBoardRows([]), [])
+  assert.deepEqual(selectBoardRows(undefined), [])
+  assert.deepEqual(selectBoardRows([null, { alias: 9 }]), [])
+})
 
 // ── card header ────────────────────────────────────────────────────────────
 

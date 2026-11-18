@@ -13,6 +13,7 @@ import {
   buildPanelItems,
   formatCardHeader,
   panelSignature,
+  selectBoardRows,
   stateBadge,
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
@@ -638,12 +639,17 @@ export function apply(ctx, rawConfig) {
   function subscribeQQ(sessionId, enabled) {
     if (enabled) {
       const alias = ensureAlias(sessionId)
-      if (qqSubscriptions.has(sessionId)) return alias
-      qqSubscriptions.set(sessionId, { alias, since: Date.now() })
-      persistQQStateSoon()
+      if (!qqSubscriptions.has(sessionId)) {
+        qqSubscriptions.set(sessionId, { alias, since: Date.now() })
+        persistQQStateSoon()
+      }
+      // The board is filtered by subscription, so the toggle itself must
+      // schedule the refresh — no later event is guaranteed to arrive.
+      schedulePanelSync()
       return alias
     }
     if (qqSubscriptions.delete(sessionId)) persistQQStateSoon()
+    schedulePanelSync()
     return qqAliases.get(sessionId) ?? 0
   }
 
@@ -890,12 +896,26 @@ export function apply(ctx, rawConfig) {
     return known ? known.state : 'idle'
   }
 
+  /**
+   * Rows the board shows.
+   *
+   * The panel is "what I care about", not a full session list: switching a
+   * session's QQ toggle off takes it off the board, and a session that is
+   * still running stays visible even with notifications off. `/ls` remains the
+   * complete list, so nothing becomes unreachable.
+   */
   function panelRows() {
-    return listRoutableSessions().map((row) => ({
+    return selectBoardRows(listRoutableSessions()).map((row) => ({
       alias: row.alias,
       title: row.title,
       state: stateOfSession(row.sessionId, row.running),
     }))
+  }
+
+  /** Forget a session that is gone, then let the board catch up. */
+  function forgetSession(sessionId) {
+    if (sessionId) sessionStates.delete(sessionId)
+    schedulePanelSync(500)
   }
 
   function schedulePanelSync(delay = PANEL_SYNC_DEBOUNCE_MS) {
@@ -1296,17 +1316,28 @@ export function apply(ctx, rawConfig) {
   ].join('\n')
 
   async function handleList(message) {
+    // Looking at the list is the natural moment to make sure the board agrees.
+    schedulePanelSync()
     const rows = listRoutableSessions()
     if (rows.length === 0) {
       await replyQQ(message.openid, message.msgId, '当前没有可投递的会话（它们可能都没打开）。')
       return
     }
-    const lines = ['**DSH 会话**']
-    for (const row of rows) {
+    // QQ swallows a leading `#`, so the alias is bolded instead of prefixed.
+    const lineOf = (row) => {
       const state = stateOfSession(row.sessionId, row.running)
-      lines.push(`#${row.alias} ${stateBadge(state)} ${row.title}${row.subscribed ? ' 🔔' : ''}`)
+      return `**#${row.alias}** ${stateBadge(state)} ${row.title}${row.subscribed ? ' 🔔' : ''}`
     }
-    lines.push('', '发送 **#别名 + 内容** 投递到该会话；**/s 别名** 查看状态')
+    const subscribed = rows.filter((row) => row.subscribed)
+    const rest = rows.filter((row) => !row.subscribed)
+    const lines = ['**DSH 会话**']
+    for (const row of subscribed) lines.push(lineOf(row))
+    if (rest.length > 0) {
+      if (subscribed.length > 0) lines.push('— 未开启 QQ 通知 —')
+      for (const row of rest) lines.push(lineOf(row))
+    }
+    lines.push('', '发送 **#别名 + 内容** 投递；**/s 别名** 看状态')
+    lines.push('面板只显示已开启通知或运行中的会话')
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
   }
 
@@ -1513,6 +1544,21 @@ export function apply(ctx, rawConfig) {
   }, { global: true, prepend: true })
 
   // ---- events -------------------------------------------------------------
+
+  // A session that closes or gets archived leaves the board, but no turn event
+  // will ever announce that — so listen to the lifecycle itself.
+  for (const eventName of ['session/disposed', 'workspace/session-archived']) {
+    try {
+      ctx.on(eventName, (payload) => {
+        const sessionId = payload && typeof payload === 'object'
+          ? payload.id ?? payload.sessionId ?? (payload.session && payload.session.id)
+          : undefined
+        forgetSession(sessionId)
+      })
+    } catch (error) {
+      log(`cannot listen to ${eventName}`, error)
+    }
+  }
 
   ctx.on('session/event', (session, event) => {
     const current = cfg()
