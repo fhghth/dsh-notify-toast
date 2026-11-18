@@ -10,10 +10,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { createQQBotLite, isPanelGone } from './qqbot-lite/index.js'
 import {
+  allocateAlias,
   buildPanelItems,
   formatCardHeader,
+  migrateQQState,
   panelSignature,
-  selectBoardRows,
   stateBadge,
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
@@ -180,6 +181,9 @@ const BOOL_KEYS = [
   'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
   'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume', 'qqPanelEnabled',
 ]
+// `qqAutoResume` is kept in the schema so existing profiles still load, but it
+// no longer gates anything: since a subscribed session can be cold after a
+// restart, delivering to one always resumes it.
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
   'settleMs', 'minIntervalMs', 'idleExitMs', 'qqMinIntervalMs',
@@ -497,7 +501,8 @@ export function apply(ctx, rawConfig) {
    * and the only way back is scrolling.
    */
   function cardHeader(emoji, sessionId, title, suffix) {
-    return formatCardHeader(emoji, qqAliases.get(sessionId) ?? 0, title, suffix)
+    const entry = qqSubscriptions.get(sessionId)
+    return formatCardHeader(emoji, entry ? entry.alias : 0, title, suffix)
   }
 
   function broadcast(payload) {
@@ -517,12 +522,9 @@ export function apply(ctx, rawConfig) {
   /** @type {{ bot: any, stop: () => void } | null} */
   let qq = null
   let qqStatus = { state: 'disabled', detail: '' }
-  /** sessionId -> { alias, since } — presence means "this session forwards". */
+  /** sessionId -> { alias, since, title }. The single source of QQ visibility. */
   const qqSubscriptions = new Map()
   const lastQQFired = new Map()
-  let qqAliasSeq = 0
-  /** sessionId -> alias. Independent from subscriptions: an alias makes a session addressable, the switch makes it notify. */
-  const qqAliases = new Map()
   /** ref_idx of a notification card -> the session it describes (for quoted-reply routing). */
   const sentCards = new Map()
   /** openids learned from inbound messages (fallback when config is empty). */
@@ -557,39 +559,16 @@ export function apply(ctx, rawConfig) {
 
   function loadQQState() {
     qqSubscriptions.clear()
-    qqAliases.clear()
-    qqAliasSeq = 0
     qqLearned = []
     qqPanelId = ''
     try {
       if (!existsSync(QQ_STATE_FILE)) return
-      const data = JSON.parse(readFileSync(QQ_STATE_FILE, 'utf8'))
-      const subscriptions = data && typeof data.subscriptions === 'object' ? data.subscriptions : {}
-      for (const [sessionId, value] of Object.entries(subscriptions)) {
-        if (!sessionId || !value || value.on === false) continue
-        qqSubscriptions.set(sessionId, {
-          alias: Number(value.alias) > 0 ? Number(value.alias) : 0,
-          since: Number(value.since) > 0 ? Number(value.since) : 0,
-        })
+      const migrated = migrateQQState(JSON.parse(readFileSync(QQ_STATE_FILE, 'utf8')))
+      for (const [sessionId, entry] of Object.entries(migrated.subscriptions)) {
+        qqSubscriptions.set(sessionId, entry)
       }
-      qqAliasSeq = Number(data?.aliasSeq) > 0 ? Number(data.aliasSeq) : 0
-      const aliases = data && typeof data.aliases === 'object' ? data.aliases : {}
-      for (const [sessionId, alias] of Object.entries(aliases)) {
-        const value = Number(alias)
-        if (!sessionId || !Number.isInteger(value) || value <= 0) continue
-        qqAliases.set(sessionId, value)
-        qqAliasSeq = Math.max(qqAliasSeq, value)
-      }
-      // Sessions subscribed before aliases were split out keep their number.
-      for (const [sessionId, entry] of qqSubscriptions) {
-        if (qqAliases.has(sessionId) || entry.alias <= 0) continue
-        qqAliases.set(sessionId, entry.alias)
-        qqAliasSeq = Math.max(qqAliasSeq, entry.alias)
-      }
-      qqLearned = Array.isArray(data?.learnedOpenids)
-        ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
-        : []
-      qqPanelId = typeof data?.panelId === 'string' ? data.panelId : ''
+      qqLearned = migrated.learnedOpenids
+      qqPanelId = migrated.panelId
     } catch (error) {
       log('qq state load failed', error)
     }
@@ -598,15 +577,10 @@ export function apply(ctx, rawConfig) {
   function flushQQState() {
     try {
       mkdirSync(QQ_DATA_DIR, { recursive: true })
-      const subscriptions = {}
-      for (const [sessionId, value] of qqSubscriptions) {
-        subscriptions[sessionId] = { on: true, alias: value.alias, since: value.since }
-      }
+      // One table: a subscription *is* the alias, the switch and the title.
       const payload = {
-        version: 2,
-        aliasSeq: qqAliasSeq,
-        subscriptions,
-        aliases: Object.fromEntries(qqAliases),
+        version: 3,
+        subscriptions: Object.fromEntries(qqSubscriptions),
         learnedOpenids: qqLearned,
         panelId: qqPanelId,
       }
@@ -626,31 +600,91 @@ export function apply(ctx, rawConfig) {
     }, 300)
   }
 
-  /** Assign a stable routing alias (never reused) to one session. */
-  function ensureAlias(sessionId) {
-    const existing = qqAliases.get(sessionId)
-    if (existing) return existing
-    qqAliasSeq += 1
-    qqAliases.set(sessionId, qqAliasSeq)
-    persistQQStateSoon()
-    return qqAliasSeq
+  /** Live agents keyed by session id (subagent sessions excluded). */
+  function liveAgents() {
+    const agents = agentsOf()
+    const list = agents && typeof agents.list === 'function' ? agents.list() : []
+    const map = new Map()
+    for (const agent of list) {
+      const session = agent && agent.session
+      if (!session || !session.id) continue
+      if (session.header && session.header.origin === 'subagent') continue
+      map.set(session.id, agent)
+    }
+    return map
   }
 
+  function safeTitle(session) {
+    try {
+      return titleOf(session) || ''
+    } catch {
+      return ''
+    }
+  }
+
+  /** Smallest number nobody holds; a closed switch gives its number back. */
+  function nextAlias() {
+    return allocateAlias([...qqSubscriptions.values()].map((entry) => entry.alias))
+  }
+
+  /**
+   * Turn the QQ switch on or off.
+   *
+   * On: allocate the lowest free alias, remember the title (the session is
+   * live right now — that is the only moment it is guaranteed to be), start
+   * forwarding. Off: release the alias and everything hanging off it.
+   */
   function subscribeQQ(sessionId, enabled) {
+    const existing = qqSubscriptions.get(sessionId)
     if (enabled) {
-      const alias = ensureAlias(sessionId)
-      if (!qqSubscriptions.has(sessionId)) {
-        qqSubscriptions.set(sessionId, { alias, since: Date.now() })
-        persistQQStateSoon()
-      }
-      // The board is filtered by subscription, so the toggle itself must
+      if (existing) return existing.alias
+      const agent = liveAgents().get(sessionId)
+      const alias = nextAlias()
+      qqSubscriptions.set(sessionId, {
+        alias,
+        since: Date.now(),
+        title: agent && agent.session ? safeTitle(agent.session) : '',
+      })
+      persistQQStateSoon()
+      // The board is built from subscriptions, so the toggle itself has to
       // schedule the refresh — no later event is guaranteed to arrive.
       schedulePanelSync()
       return alias
     }
-    if (qqSubscriptions.delete(sessionId)) persistQQStateSoon()
+    if (!existing) return 0
+    qqSubscriptions.delete(sessionId)
+    releaseParkedDecision(sessionId)
+    sessionStates.delete(sessionId)
+    persistQQStateSoon()
     schedulePanelSync()
-    return qqAliases.get(sessionId) ?? 0
+    return 0
+  }
+
+  /**
+   * Release a parked approval/question before dropping its session.
+   *
+   * Without this the waiting tool call would hang forever: the promise that
+   * the agent is blocked on belongs to us and would never settle.
+   */
+  function releaseParkedDecision(sessionId) {
+    const approval = pendingApprovals.get(sessionId)
+    if (approval) {
+      pendingApprovals.delete(sessionId)
+      if (approval.onAbort && approval.request.signal) {
+        approval.request.signal.removeEventListener('abort', approval.onAbort)
+      }
+      approval.resolve('cancelled')
+    }
+    const question = pendingQuestions.get(sessionId)
+    if (question) {
+      pendingQuestions.delete(sessionId)
+      if (question.onAbort && question.request.signal) {
+        question.request.signal.removeEventListener('abort', question.onAbort)
+      }
+      const error = new Error('QQ notifications were turned off before the question was answered')
+      error.code = 'ASK_ABORTED'
+      question.reject(error)
+    }
   }
 
   function qqGlobalState() {
@@ -667,7 +701,7 @@ export function apply(ctx, rawConfig) {
 
   function qqSessionState(sessionId) {
     const entry = qqSubscriptions.get(sessionId)
-    return { sessionId, on: Boolean(entry), alias: qqAliases.get(sessionId) ?? 0 }
+    return { sessionId, on: Boolean(entry), alias: entry ? entry.alias : 0 }
   }
 
   /** Configured openids, or whoever talked to the bot first. */
@@ -905,10 +939,10 @@ export function apply(ctx, rawConfig) {
    * complete list, so nothing becomes unreachable.
    */
   function panelRows() {
-    return selectBoardRows(listRoutableSessions()).map((row) => ({
+    return qqVisibleSessions().map((row) => ({
       alias: row.alias,
       title: row.title,
-      state: stateOfSession(row.sessionId, row.running),
+      state: row.state,
     }))
   }
 
@@ -1099,7 +1133,7 @@ export function apply(ctx, rawConfig) {
   async function parkApproval(request) {
     const session = request.agent.session
     const sessionId = session.id
-    const alias = qqAliases.get(sessionId) ?? 0
+    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
     const markdown = approvalCardText(
       sessionId,
       titleOf(session),
@@ -1134,7 +1168,7 @@ export function apply(ctx, rawConfig) {
     const questions = Array.isArray(request.questions) ? request.questions : []
     if (questions.length === 0) return undefined
     const title = titleOf(session)
-    const alias = qqAliases.get(sessionId) ?? 0
+    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
     const refIds = await sendCardToTargets(
       questionCardText(sessionId, title, questions[0], 1, questions.length),
       sessionId,
@@ -1275,23 +1309,42 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** Live, addressable sessions with their titles and stable aliases. */
-  function listRoutableSessions() {
-    const agents = agentsOf()
-    const list = agents && typeof agents.list === 'function' ? agents.list() : []
+  /**
+   * Every session QQ knows about: exactly the subscriptions, live or not.
+   *
+   * A subscription survives restarts, an agent does not. So a subscribed
+   * session can be missing from `agents.list()` — that is the `cold` state, and
+   * it is still listed. Showing it is the whole point of subscribing: after a
+   * restart the phone still says which sessions are wired up.
+   *
+   * Rows are sorted by alias so the numbering reads naturally; the panel
+   * re-sorts by urgency later.
+   */
+  function qqVisibleSessions() {
+    const live = liveAgents()
     const excluded = qqOwnedSessionIds()
     const rows = []
-    for (const agent of list) {
-      const session = agent && agent.session
-      if (!session || !session.id) continue
-      if (session.header && session.header.origin === 'subagent') continue
-      if (excluded.has(session.id)) continue
+    for (const [sessionId, entry] of qqSubscriptions) {
+      if (excluded.has(sessionId)) continue
+      const agent = live.get(sessionId)
+      let title = entry.title || ''
+      if (agent && agent.session) {
+        const fresh = safeTitle(agent.session)
+        if (fresh && fresh !== entry.title) {
+          entry.title = fresh
+          persistQQStateSoon()
+        }
+        title = fresh || title
+      }
+      const running = Boolean(agent && agent.status === 'running')
       rows.push({
-        sessionId: session.id,
-        alias: ensureAlias(session.id),
-        title: titleOf(session),
-        running: agent.status === 'running',
-        subscribed: qqSubscriptions.has(session.id),
+        sessionId,
+        alias: entry.alias,
+        since: entry.since,
+        title: title || `会话 ${sessionId.slice(-8)}`,
+        live: Boolean(agent),
+        running,
+        state: agent ? stateOfSession(sessionId, running) : 'cold',
       })
     }
     rows.sort((a, b) => a.alias - b.alias)
@@ -1300,7 +1353,7 @@ export function apply(ctx, rawConfig) {
 
   function aliasToSessionMap() {
     const map = new Map()
-    for (const [sessionId, alias] of qqAliases) map.set(alias, sessionId)
+    for (const [sessionId, entry] of qqSubscriptions) map.set(entry.alias, sessionId)
     return map
   }
 
@@ -1318,26 +1371,22 @@ export function apply(ctx, rawConfig) {
   async function handleList(message) {
     // Looking at the list is the natural moment to make sure the board agrees.
     schedulePanelSync()
-    const rows = listRoutableSessions()
+    const rows = qqVisibleSessions()
     if (rows.length === 0) {
-      await replyQQ(message.openid, message.msgId, '当前没有可投递的会话（它们可能都没打开）。')
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        '当前没有开启 QQ 通知的会话。\n在 DSH 会话标题栏点 **QQ** 图标即可开启。',
+      )
       return
     }
     // QQ swallows a leading `#`, so the alias is bolded instead of prefixed.
-    const lineOf = (row) => {
-      const state = stateOfSession(row.sessionId, row.running)
-      return `**#${row.alias}** ${stateBadge(state)} ${row.title}${row.subscribed ? ' 🔔' : ''}`
-    }
-    const subscribed = rows.filter((row) => row.subscribed)
-    const rest = rows.filter((row) => !row.subscribed)
     const lines = ['**DSH 会话**']
-    for (const row of subscribed) lines.push(lineOf(row))
-    if (rest.length > 0) {
-      if (subscribed.length > 0) lines.push('— 未开启 QQ 通知 —')
-      for (const row of rest) lines.push(lineOf(row))
-    }
+    for (const row of rows) lines.push(`**#${row.alias}** ${stateBadge(row.state)} ${row.title}`)
     lines.push('', '发送 **#别名 + 内容** 投递；**/s 别名** 看状态')
-    lines.push('面板只显示已开启通知或运行中的会话')
+    if (rows.some((row) => !row.live)) {
+      lines.push('💤 未打开 = 会话当前没在 DSH 里运行，发消息会自动打开它')
+    }
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
   }
 
@@ -1349,44 +1398,47 @@ export function apply(ctx, rawConfig) {
     }
     const sessionId = aliasToSessionMap().get(command.alias)
     if (!sessionId) {
-      await replyQQ(message.openid, message.msgId, `没有 #${command.alias} 这个会话，发送 /ls 查看`)
-      return
-    }
-    const row = listRoutableSessions().find((item) => item.sessionId === sessionId)
-    if (!row) {
       await replyQQ(
         message.openid,
         message.msgId,
-        `#${command.alias} 当前没有打开。别名仍然可用（\`#${command.alias} 内容\` 投递），但需要先在 DSH 打开该会话。`,
+        `没有 #${command.alias} 这个会话，发送 /ls 查看（编号在关闭通知后会释放，可能已被别的会话占用）`,
       )
       return
     }
-    const state = stateOfSession(sessionId, row.running)
-    const known = sessionStates.get(sessionId)
+    const row = qqVisibleSessions().find((item) => item.sessionId === sessionId)
+    if (!row) {
+      await replyQQ(message.openid, message.msgId, `#${command.alias} 不在 QQ 通知里，发送 /ls 查看`)
+      return
+    }
     const lines = [cardHeader('', sessionId, row.title, '')]
-    lines.push(`状态：${stateBadge(state)}`)
-    if (known && known.at) lines.push(`更新：${fmtRelative(Date.now() - known.at)}前`)
+    lines.push(`状态：${stateBadge(row.state)}`)
+    if (row.live) {
+      const known = sessionStates.get(sessionId)
+      if (known && known.at) lines.push(`更新：${fmtRelative(Date.now() - known.at)}前`)
+    } else if (row.since) {
+      lines.push(`开启于：${new Date(row.since).toLocaleString()}`)
+    }
+    lines.push(`QQ 通知：🔔 已开启（\`/off ${row.alias}\` 关闭）`)
     lines.push(
-      row.subscribed
-        ? `QQ 通知：🔔 已开启（\`/off ${row.alias}\` 关闭）`
-        : `QQ 通知：已关闭（在 DSH 会话标题栏点 QQ 图标开启）`,
+      '',
+      row.live
+        ? `发送 **#${row.alias} 内容** 可直接投递到该会话`
+        : `发送 **#${row.alias} 内容** 投递，会自动在 DSH 中打开这个会话`,
     )
-    lines.push('', `发送 **#${row.alias} 内容** 可直接投递到该会话`)
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
   }
 
   async function handleStatus(message) {
-    const aliases = [...qqAliases.entries()]
-      .sort((a, b) => a[1] - b[1])
-      .map(([, alias]) => `#${alias}`)
-      .join(' ')
+    const rows = qqVisibleSessions()
+    const liveCount = rows.filter((row) => row.live).length
+    const aliases = rows.map((row) => `#${row.alias}`).join(' ')
     const lines = [
       '**QQ 通道**',
-      `状态：${qqStatus.state}${qqStatus.detail ? ' · ' + qqStatus.detail : ''}`,
-      `订阅：${qqSubscriptions.size} 个会话`,
+      `状态：${qqStatus.state}${qqStatus.state === 'ready' || !qqStatus.detail ? '' : ' · ' + qqStatus.detail}`,
+      `订阅：${rows.length} 个会话（${liveCount} 个已打开）`,
       `待处理决策：${pendingApprovals.size + pendingQuestions.size}`,
       `指令面板：${cfg().qqPanelEnabled ? (qqPanelId ? '已同步' : '待创建') : '已关闭'}`,
-      `别名：${aliases || '（无，发送 /ls 分配）'}`,
+      `别名：${aliases || '（无）'}`,
     ]
     await replyQQ(message.openid, message.msgId, lines.join('\n'))
   }
@@ -1403,7 +1455,11 @@ export function apply(ctx, rawConfig) {
     }
     subscribeQQ(sessionId, false)
     broadcast({ type: 'qq-subscription', sessionId, on: false, alias: command.alias })
-    await replyQQ(message.openid, message.msgId, `已取消 #${command.alias} 的 QQ 通知（别名仍可用于投递）`)
+    await replyQQ(
+      message.openid,
+      message.msgId,
+      `已关闭 #${command.alias} 的 QQ 通知，编号已释放`,
+    )
   }
 
   async function handleCommand(command, message) {
@@ -1419,35 +1475,37 @@ export function apply(ctx, rawConfig) {
    *
    * Uses the same `followup(createUserMessage(...))` entry the conversation
    * plugin uses, so the message lands in the session's inbox and the agent
-   * picks it up at the next step boundary. Cold sessions are refused unless
-   * `qqAutoResume` is on (resuming wakes an agent the user may not expect).
+   * picks it up at the next step boundary.
+   *
+   * A subscribed session can be cold (DSH restarted, nothing opened it). The
+   * phone is exactly where the user expects it to keep working, so the alias
+   * is enough to wake it: `agents.resume()` reloads the log into a live agent.
    */
   async function deliverToSession(sessionId, text, message) {
-    const alias = qqAliases.get(sessionId) ?? 0
+    const entry = qqSubscriptions.get(sessionId)
+    const alias = entry ? entry.alias : 0
     const agents = agentsOf()
     let agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined
+    let woke = false
     if (!agent) {
-      if (!cfg().qqAutoResume) {
-        await replyQQ(
-          message.openid,
-          message.msgId,
-          `会话 #${alias} 当前没有打开（没有活动 agent）。请先在 DSH 打开它，或在设置里开启「自动唤醒冷会话」。`,
-        )
-        return
-      }
       if (!agents || typeof agents.resume !== 'function') {
-        await replyQQ(message.openid, message.msgId, `无法唤醒会话 #${alias}：agents 服务不可用`)
+        await replyQQ(message.openid, message.msgId, `无法打开会话 #${alias}：agents 服务不可用`)
         return
       }
       try {
         const handle = await agents.resume({ resumeSessionId: sessionId })
         agent = handle.agent
+        woke = Boolean(agent)
       } catch (error) {
         await replyQQ(
           message.openid,
           message.msgId,
-          `无法唤醒会话 #${alias}：${error && error.message ? error.message : error}`,
+          `无法打开会话 #${alias}：${error && error.message ? error.message : error}`,
         )
+        return
+      }
+      if (!agent) {
+        await replyQQ(message.openid, message.msgId, `无法打开会话 #${alias}：恢复后仍没有 agent`)
         return
       }
     }
@@ -1455,11 +1513,8 @@ export function apply(ctx, rawConfig) {
       const wasRunning = agent.status === 'running'
       const createUserMessage = await loadCreateUserMessage()
       agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
-      await replyQQ(
-        message.openid,
-        message.msgId,
-        `✅ 已投递到 #${alias}${wasRunning ? '（会话忙，已排队）' : ''}`,
-      )
+      const note = woke ? '（已自动打开该会话）' : wasRunning ? '（会话忙，已排队）' : ''
+      await replyQQ(message.openid, message.msgId, `✅ 已投递到 #${alias}${note}`)
     } catch (error) {
       await replyQQ(
         message.openid,
@@ -1503,6 +1558,15 @@ export function apply(ctx, rawConfig) {
       return true
     }
     if (route.kind === 'session') {
+      // A quoted card can outlive the subscription it came from.
+      if (!qqSubscriptions.has(route.sessionId)) {
+        await replyQQ(
+          message.openid,
+          message.msgId,
+          '该会话的 QQ 通知已关闭，先到 DSH 会话标题栏点 QQ 图标重新开启。',
+        )
+        return true
+      }
       await deliverToSession(route.sessionId, route.payload, message)
       return true
     }
@@ -2019,10 +2083,46 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
+  /**
+   * Fill in titles for subscriptions that predate the stored title field.
+   *
+   * Tries the sessions service first, which may expose a session without an
+   * agent. If that call turns out to allocate an agent, it is switched off for
+   * good — waking sessions just to read a label is not acceptable.
+   */
+  let sessionPeek = true
+  function backfillTitles() {
+    for (const [sessionId, entry] of qqSubscriptions) {
+      if (entry.title) continue
+      const title = peekTitle(sessionId)
+      if (!title) continue
+      entry.title = title
+    }
+    persistQQStateSoon()
+  }
+
+  function peekTitle(sessionId) {
+    if (!sessionPeek) return ''
+    try {
+      const before = liveAgents().size
+      const session = ctx.sessions.get(sessionId)
+      if (liveAgents().size > before) {
+        sessionPeek = false
+        log('session peek allocates agents; disabled')
+        return ''
+      }
+      return session ? safeTitle(session) : ''
+    } catch {
+      sessionPeek = false
+      return ''
+    }
+  }
+
   // ---- QQ channel lifecycle -----------------------------------------------
 
   ctx.effect(() => {
     loadQQState()
+    backfillTitles()
     startQQBridge()
     return () => {
       stopQQBridge()

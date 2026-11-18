@@ -11,13 +11,14 @@ import { createTokenSource } from '../qqbot-lite/token.js'
 import { createApi } from '../qqbot-lite/api.js'
 import { createPanelApi, isPanelGone, PANEL_GONE_CODE } from '../qqbot-lite/panel.js'
 import {
+  allocateAlias,
   buildPanelItems,
   buildPanelPayload,
   clipWidth,
   displayWidth,
   formatCardHeader,
+  migrateQQState,
   panelSignature,
-  selectBoardRows,
   stateBadge,
   PANEL_DESC_LIMIT,
   PANEL_ITEM_LIMIT,
@@ -45,17 +46,59 @@ function panelApiFor(mock) {
   return createPanelApi(api.request)
 }
 
-test('selectBoardRows: unsubscribed finished sessions leave the board', () => {
-  const rows = [
-    { alias: 1, subscribed: true, running: false },
-    { alias: 4, subscribed: false, running: false },
-    { alias: 5, subscribed: true, running: true },
-    { alias: 6, subscribed: false, running: true },
-  ]
-  assert.deepEqual(selectBoardRows(rows).map((row) => row.alias), [1, 5, 6])
-  assert.deepEqual(selectBoardRows([]), [])
-  assert.deepEqual(selectBoardRows(undefined), [])
-  assert.deepEqual(selectBoardRows([null, { alias: 9 }]), [])
+test('allocateAlias: reuses the lowest freed number', () => {
+  assert.equal(allocateAlias([]), 1)
+  assert.equal(allocateAlias([1]), 2)
+  assert.equal(allocateAlias([1, 5]), 2)
+  assert.equal(allocateAlias(new Set([2, 3, 4])), 1)
+  assert.equal(allocateAlias([0, -1, 'x', null]), 1)
+  assert.equal(allocateAlias(undefined), 1)
+})
+
+test('migrateQQState: drops alias-only entries left by the /ls side effect', () => {
+  const migrated = migrateQQState({
+    version: 2,
+    aliasSeq: 6,
+    subscriptions: { s1: { on: true, alias: 1, since: 10 } },
+    aliases: { s1: 1, s4: 4, s5: 5, s6: 6 },
+    learnedOpenids: ['u1'],
+    panelId: 'p1',
+  })
+  assert.equal(migrated.version, 3)
+  assert.deepEqual(Object.keys(migrated.subscriptions), ['s1'])
+  assert.deepEqual(migrated.subscriptions.s1, { alias: 1, since: 10, title: '' })
+  assert.deepEqual(migrated.learnedOpenids, ['u1'])
+  assert.equal(migrated.panelId, 'p1')
+})
+
+test('migrateQQState: duplicate aliases are renumbered, existing ones are kept', () => {
+  const migrated = migrateQQState({
+    subscriptions: {
+      a: { on: true, alias: 2, since: 1 },
+      b: { on: true, alias: 2, since: 2 },
+      c: { on: true, since: 3 },
+    },
+    aliases: { c: 7 },
+  })
+  const aliases = Object.values(migrated.subscriptions).map((entry) => entry.alias)
+  assert.equal(new Set(aliases).size, aliases.length)
+  assert.ok(aliases.every((number) => Number.isInteger(number) && number > 0))
+  // The first holder of 2 keeps it, the second moves to the lowest free number,
+  // and an alias already recorded in the old table is preserved.
+  assert.equal(migrated.subscriptions.a.alias, 2)
+  assert.equal(migrated.subscriptions.b.alias, 1)
+  assert.equal(migrated.subscriptions.c.alias, 7)
+})
+
+test('migrateQQState: tolerates garbage and old shapes', () => {
+  assert.deepEqual(migrateQQState(undefined).subscriptions, {})
+  assert.deepEqual(migrateQQState('nope').subscriptions, {})
+  assert.deepEqual(
+    migrateQQState({ subscriptions: { a: { on: false, alias: 1 } } }).subscriptions,
+    {},
+  )
+  const legacy = migrateQQState({ subscriptions: { a: 1 } })
+  assert.equal(legacy.subscriptions.a.alias, 1)
 })
 
 // ── card header ────────────────────────────────────────────────────────────
@@ -113,6 +156,16 @@ test('buildPanelItems: urgent sessions come first, then running, then done', () 
   ])
   const names = items.map((item) => item.name)
   assert.deepEqual(names, ['/s 4', '/s 3', '/s 1', '/s 2', '/ls', '/status'])
+})
+
+test('buildPanelItems: cold sessions sort last but are still listed', () => {
+  const items = buildPanelItems([
+    { alias: 2, title: '冷的', state: 'cold' },
+    { alias: 3, title: '在跑', state: 'running' },
+    { alias: 4, title: '等审批', state: 'approval' },
+  ])
+  assert.deepEqual(items.map((item) => item.name), ['/s 4', '/s 3', '/s 2', '/ls', '/status'])
+  assert.match(items[2].desc, /未打开/)
 })
 
 test('buildPanelItems: item names are commands and stay inside the limits', () => {

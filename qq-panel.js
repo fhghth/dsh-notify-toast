@@ -25,7 +25,7 @@ export const PANEL_DESC_LIMIT = 30
 /** Marks the panel as ours when scanning `GET /v2/panels`. */
 export const PANEL_REMARK = 'dsh-notify-toast/sessions'
 
-/** Session states, most urgent first. `idle` is the fallback. */
+/** Session states, most urgent first. `cold` is a subscribed session with no agent. */
 const STATE_RANK = {
   approval: 0,
   question: 0,
@@ -35,6 +35,7 @@ const STATE_RANK = {
   running: 2,
   completed: 3,
   idle: 4,
+  cold: 5,
 }
 
 const STATE_BADGE = {
@@ -46,6 +47,7 @@ const STATE_BADGE = {
   running: '▶ 运行中',
   completed: '✅ 完成',
   idle: '·',
+  cold: '💤 未打开',
 }
 
 /** East-Asian wide / fullwidth / emoji ranges, each 2 columns in QQ. */
@@ -162,18 +164,80 @@ export function buildPanelPayload(rows, options) {
 }
 
 /**
- * Which sessions belong on the board.
+ * Smallest alias number nobody is using.
  *
- * The panel is "what I care about", not a full session list. Turning a
- * session's QQ switch off removes it, and anything still running stays visible
- * even with notifications off. `/ls` is the complete list.
+ * Numbers are recycled: turning a session's QQ switch off frees its number and
+ * the next subscription takes the lowest free one. Aliases are only ever read
+ * from the current subscription table, so a recycled number can never deliver
+ * to the previous owner's session.
  *
- * @param {Array<{ subscribed?: boolean, running?: boolean }>} rows
+ * @param {Iterable<number>} taken
  */
-export function selectBoardRows(rows) {
-  return (Array.isArray(rows) ? rows : []).filter(
-    (row) => row && (row.subscribed === true || row.running === true),
-  )
+export function allocateAlias(taken) {
+  const used = new Set()
+  for (const value of taken ?? []) {
+    const number = Number(value)
+    if (Number.isInteger(number) && number > 0) used.add(number)
+  }
+  let next = 1
+  while (used.has(next)) next += 1
+  return next
+}
+
+/**
+ * Normalize any state file this plugin has ever written into the v3 shape.
+ *
+ * v2 kept `aliases` and `subscriptions` as two tables, which drifted apart:
+ * a session could hold an alias without being subscribed (the `/ls` side
+ * effect). v3 makes the subscription the only truth, so alias-only entries are
+ * dropped here — that is what retires the stale numbers after an upgrade.
+ *
+ * @param {any} raw parsed `state.json`
+ * @returns {{ version: number, subscriptions: Record<string, { alias: number, since: number, title: string }>, learnedOpenids: string[], panelId: string }}
+ */
+export function migrateQQState(raw) {
+  const data = raw && typeof raw === 'object' ? raw : {}
+  const rawSubscriptions = data.subscriptions && typeof data.subscriptions === 'object'
+    ? data.subscriptions
+    : {}
+  const rawAliases = data.aliases && typeof data.aliases === 'object' ? data.aliases : {}
+
+  const collected = []
+  for (const [sessionId, value] of Object.entries(rawSubscriptions)) {
+    if (!sessionId) continue
+    const entry = value && typeof value === 'object' ? value : {}
+    if (entry.on === false) continue
+    const fromEntry = Number(entry.alias)
+    const fromTable = Number(rawAliases[sessionId])
+    collected.push({
+      sessionId,
+      alias: Number.isInteger(fromEntry) && fromEntry > 0
+        ? fromEntry
+        : Number.isInteger(fromTable) && fromTable > 0
+          ? fromTable
+          : 0,
+      since: Number(entry.since) > 0 ? Number(entry.since) : 0,
+      title: typeof entry.title === 'string' ? entry.title : '',
+    })
+  }
+
+  const subscriptions = {}
+  const used = new Set()
+  for (const item of collected) {
+    let alias = item.alias
+    if (alias <= 0 || used.has(alias)) alias = allocateAlias(used)
+    used.add(alias)
+    subscriptions[item.sessionId] = { alias, since: item.since, title: item.title }
+  }
+
+  return {
+    version: 3,
+    subscriptions,
+    learnedOpenids: Array.isArray(data.learnedOpenids)
+      ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
+      : [],
+    panelId: typeof data.panelId === 'string' ? data.panelId : '',
+  }
 }
 
 /** Cheap change detector so unchanged boards are never re-pushed. */
