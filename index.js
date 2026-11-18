@@ -9,6 +9,12 @@ import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { createQQBotLite } from './qqbot-lite/index.js'
+import {
+  extractRefIdx,
+  parseApprovalOutcome,
+  parseQuestionAnswer,
+  selectPendingDecision,
+} from './qq-answer.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 
@@ -114,12 +120,15 @@ const DEFAULTS = {
   qqNotifyOnComplete: true,
   qqNotifyOnError: true,
   qqMinIntervalMs: 30000,
+  qqAnswerApprovals: false,
+  qqAnswerQuestions: false,
 }
 
 const BOOL_KEYS = [
   'enabled', 'notifyOnComplete', 'notifyOnApproval', 'notifyOnQuestion', 'notifyOnError',
   'soundEnabled', 'showElapsed', 'clickToOpenSession', 'debug',
   'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
+  'qqAnswerApprovals', 'qqAnswerQuestions',
 ]
 const NUM_KEYS = [
   'width', 'height', 'scale', 'margin', 'gap', 'maxCards', 'durationMs',
@@ -608,8 +617,8 @@ export function apply(ctx, rawConfig) {
       }
     })
 
-    // P1 has no session routing yet: answer a message with instructions so the
-    // user can tell "the bot is alive" from "the bot is not connected".
+    // Inbound routing: a reply that answers a parked approval/question is
+    // consumed here; anything else gets the connection guide.
     bot.on('message', async (message) => {
       const openid = message.openid ?? message.memberOpenid
       if (openid && !qqLearned.includes(openid)) {
@@ -618,12 +627,13 @@ export function apply(ctx, rawConfig) {
         broadcast({ type: 'qq-status', ...qqGlobalState() })
       }
       if (!openid || !message.msgId) return
+      if (await routeInbound(message)) return
       try {
         await bot.sendC2C(openid, {
           markdown: [
             '**通知机器人已连接**',
             '在 DSH 会话标题栏点 **QQ** 图标，即可让该会话把通知转发到这里。',
-            '（当前版本只支持通知推送，暂不支持在这里对话）',
+            '（当前版本只支持通知与审批/提问回复，暂不支持发消息给会话）',
           ].join('\n'),
           msgId: message.msgId,
         })
@@ -663,6 +673,284 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  // ---- QQ answer routing (approvals + questions) --------------------------
+  //
+  // DSH composes both decisions as Cordis waterfalls:
+  //   approval/request       -> ApprovalOutcome  (allowed-once | rejected | cancelled | unavailable)
+  //   user-questions/request -> { answers: [{ id, selected, custom? }] }
+  // A listener that does not call next() becomes the answerer. We prepend and
+  // park, so the phone is the only dialog for that turn — that is what makes a
+  // reply from QQ actually reach the waiting tool call.
+  //
+  // Only used when both switches are on (channel + per session) AND the global
+  // answer switches are on; otherwise the request falls through to the desktop
+  // UI untouched.
+
+  const pendingApprovals = new Map()
+  const pendingQuestions = new Map()
+
+  function isAllowedSender(openid) {
+    if (!openid) return false
+    const configured = String(cfg().qqOpenids ?? '')
+      .split(/[\s,;，；]+/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+    if (configured.length > 0) return configured.includes(openid)
+    return qqLearned.includes(openid)
+  }
+
+  function qqAnswerReady() {
+    return Boolean(cfg().qqEnabled) && qqStatus.state === 'ready' && qqTargets().length > 0
+  }
+
+  /** Recover the gated command from the session log (the request itself omits it). */
+  function commandOfCall(session, callId) {
+    if (callId === undefined) return undefined
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : []
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index]
+        if (!event || event.type !== 'tool/call') continue
+        if (String(event.data?.callId) !== String(callId)) continue
+        const raw = event.data?.arguments
+        if (typeof raw !== 'string') return undefined
+        try {
+          const parsed = JSON.parse(raw)
+          if (parsed && typeof parsed === 'object' && typeof parsed.command === 'string') {
+            return parsed.command.length > 300 ? `${parsed.command.slice(0, 300)}…` : parsed.command
+          }
+        } catch {
+          /* not JSON: fall through with the raw text */
+        }
+        return raw.length > 300 ? `${raw.slice(0, 300)}…` : raw
+      }
+    } catch {}
+    return undefined
+  }
+
+  function approvalCardText(title, request, command) {
+    const lines = ['🔒 **需要权限审批**', `标题：${title}`]
+    if (request?.toolName) lines.push(`工具：${request.toolName}`)
+    if (command) lines.push('命令：\n```\n' + command + '\n```')
+    if (request?.reason) lines.push(`原因：${request.reason}`)
+    lines.push('', '回复 **ok** 允许一次，**no** 拒绝')
+    return lines.join('\n')
+  }
+
+  function questionCardText(title, question, index, total) {
+    const lines = [`❓ **需要你回答**（${index}/${total}）`, `标题：${title}`, `问题：${question.question}`]
+    const options = Array.isArray(question.options) ? question.options : []
+    if (options.length > 0) {
+      lines.push('')
+      options.forEach((option, i) => {
+        lines.push(`${i + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
+      })
+      lines.push('', question.multiSelect ? '回复编号选择（多选用逗号），或直接输入文字' : '回复编号选择，或直接输入文字')
+    } else {
+      lines.push('', '直接输入你的回答')
+    }
+    return lines.join('\n')
+  }
+
+  /** Send one markdown card to every target; returns the ref_idx list, or undefined when nothing went out. */
+  async function sendCardToTargets(markdown) {
+    if (!qq || qqStatus.state !== 'ready') return undefined
+    const targets = qqTargets()
+    if (targets.length === 0) return undefined
+    const refIds = []
+    let delivered = false
+    for (const openid of targets) {
+      try {
+        const sent = await qq.bot.sendC2C(openid, { markdown })
+        delivered = true
+        if (sent && sent.refIdx) refIds.push(sent.refIdx)
+      } catch (error) {
+        console.warn('[notify-toast] QQ 卡片发送失败:', error && error.message ? error.message : error)
+      }
+    }
+    return delivered ? refIds : undefined
+  }
+
+  async function parkApproval(request) {
+    const session = request.agent.session
+    const sessionId = session.id
+    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
+    const markdown = approvalCardText(titleOf(session), request, commandOfCall(session, request.callId))
+    const refIds = await sendCardToTargets(markdown)
+    if (!refIds) return undefined
+
+    const entry = { sessionId, alias, request, refIds, resolve: () => {}, onAbort: undefined }
+    const promise = new Promise((resolve) => {
+      entry.resolve = resolve
+    })
+    if (request.signal) {
+      const onAbort = () => {
+        if (pendingApprovals.get(sessionId) !== entry) return
+        pendingApprovals.delete(sessionId)
+        resolve('cancelled')
+      }
+      entry.onAbort = onAbort
+      request.signal.addEventListener('abort', onAbort, { once: true })
+    }
+    pendingApprovals.set(sessionId, entry)
+    log(`qq approval parked: session=${sessionId}`)
+    return promise
+  }
+
+  async function parkQuestion(request) {
+    const session = request.agent.session
+    const sessionId = session.id
+    const questions = Array.isArray(request.questions) ? request.questions : []
+    if (questions.length === 0) return undefined
+    const title = titleOf(session)
+    const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
+    const refIds = await sendCardToTargets(questionCardText(title, questions[0], 1, questions.length))
+    if (!refIds) return undefined
+
+    const entry = {
+      sessionId,
+      alias,
+      title,
+      request,
+      refIds,
+      index: 0,
+      collected: [],
+      resolve: () => {},
+      reject: () => {},
+      onAbort: undefined,
+    }
+    const promise = new Promise((resolve, reject) => {
+      entry.resolve = resolve
+      entry.reject = reject
+    })
+    if (request.signal) {
+      const onAbort = () => {
+        if (pendingQuestions.get(sessionId) !== entry) return
+        pendingQuestions.delete(sessionId)
+        const error = new Error('ask_user_question was aborted before the user answered')
+        error.code = 'ASK_ABORTED'
+        reject(error)
+      }
+      entry.onAbort = onAbort
+      request.signal.addEventListener('abort', onAbort, { once: true })
+    }
+    pendingQuestions.set(sessionId, entry)
+    log(`qq question parked: session=${sessionId} count=${questions.length}`)
+    return promise
+  }
+
+  async function replyQQ(openid, msgId, markdown) {
+    if (!qq || !openid || !msgId) return
+    try {
+      await qq.bot.sendC2C(openid, { markdown, msgId })
+    } catch (error) {
+      log('qq ack failed', error && error.message ? error.message : error)
+    }
+  }
+
+  /** Resolve one parked approval/question with the reply text. */
+  async function answerPending(target, payload, message) {
+    const openid = message.openid
+    const msgId = message.msgId
+    if (target.kind === 'approval') {
+      const entry = target.entry
+      const outcome = parseApprovalOutcome(payload)
+      if (!outcome) {
+        await replyQQ(openid, msgId, '没看懂：回复 **ok** 允许一次，或 **no** 拒绝')
+        return
+      }
+      pendingApprovals.delete(entry.sessionId)
+      if (entry.onAbort && entry.request.signal) {
+        entry.request.signal.removeEventListener('abort', entry.onAbort)
+      }
+      entry.resolve(outcome)
+      await replyQQ(
+        openid,
+        msgId,
+        `${outcome === 'allowed-once' ? '✅ 已允许一次' : '🚫 已拒绝'}（会话 #${entry.alias}）`,
+      )
+      return
+    }
+
+    const entry = target.entry
+    const question = entry.request.questions[entry.index]
+    if (!question) {
+      pendingQuestions.delete(entry.sessionId)
+      return
+    }
+    entry.collected.push(parseQuestionAnswer(question, payload))
+    entry.index += 1
+    if (entry.index < entry.request.questions.length) {
+      const next = entry.request.questions[entry.index]
+      const refIds = await sendCardToTargets(questionCardText(entry.title, next, entry.index + 1, entry.request.questions.length))
+      if (refIds) entry.refIds.push(...refIds)
+      await replyQQ(openid, msgId, `✅ 第 ${entry.index} 题已记录（会话 #${entry.alias}），下一题已发送`)
+      return
+    }
+    pendingQuestions.delete(entry.sessionId)
+    if (entry.onAbort && entry.request.signal) {
+      entry.request.signal.removeEventListener('abort', entry.onAbort)
+    }
+    entry.resolve({ answers: entry.collected })
+    await replyQQ(openid, msgId, `✅ 已提交全部回答（会话 #${entry.alias}）`)
+  }
+
+  /**
+   * Route one inbound message to a parked decision.
+   *
+   * Resolution order: the quoted card (ref_idx) -> `#alias` prefix -> the only
+   * pending decision. Session message routing (P4) slots in after this chain.
+   *
+   * @returns true when the message was consumed.
+   */
+  async function routeInbound(message) {
+    const openid = message.openid ?? message.memberOpenid
+    if (!isAllowedSender(openid)) return false
+    const text = String(message.content ?? '').trim()
+    if (!text) return false
+
+    const target = selectPendingDecision({
+      approvals: pendingApprovals.values(),
+      questions: pendingQuestions.values(),
+      refIdx: extractRefIdx(message.raw),
+      text,
+    })
+    if (!target) return false
+
+    await answerPending(target, target.payload, message)
+    return true
+  }
+
+  ctx.on('approval/request', async (req, next) => {
+    try {
+      const current = cfg()
+      const sessionId = req && req.agent ? req.agent.id : undefined
+      if (!current.qqEnabled || !current.qqAnswerApprovals) return next()
+      if (!sessionId || !qqSubscriptions.has(sessionId)) return next()
+      if (!qqAnswerReady()) return next()
+      const parked = await parkApproval(req)
+      return parked ?? next()
+    } catch (error) {
+      log('qq approval answerer failed', error)
+      return next()
+    }
+  }, { global: true, prepend: true })
+
+  ctx.on('user-questions/request', async (req, next) => {
+    try {
+      const current = cfg()
+      const sessionId = req && req.agent ? req.agent.id : undefined
+      if (!current.qqEnabled || !current.qqAnswerQuestions) return next()
+      if (!sessionId || !qqSubscriptions.has(sessionId)) return next()
+      if (!qqAnswerReady()) return next()
+      const parked = await parkQuestion(req)
+      return parked ?? next()
+    } catch (error) {
+      log('qq question answerer failed', error)
+      return next()
+    }
+  }, { global: true, prepend: true })
+
   // ---- events -------------------------------------------------------------
 
   ctx.on('session/event', (session, event) => {
@@ -682,15 +970,30 @@ export function apply(ctx, rawConfig) {
     // answerer, so it fires even when the UI claims the approval/request
     // waterfall first and later listeners never run.
     if (event.type === 'approval/asked') {
-      if (!current.notifyOnApproval) return
       const data = event.data || {}
       const tool = data.toolName || '工具'
-      show({
-        kind: 'approval',
-        title: titleOf(session),
-        subtitle: '需要权限审批 · ' + tool,
-        sessionId: session.id,
-      })
+      const sessionId = session.id
+      if (current.notifyOnApproval) {
+        show({
+          kind: 'approval',
+          title: titleOf(session),
+          subtitle: '需要权限审批 · ' + tool,
+          sessionId,
+        })
+      }
+      // When QQ owns the decision it sends its own card with the buttons, so a
+      // second "go handle it in DSH" card would only mislead.
+      const qqNotify = Boolean(
+        current.qqEnabled && !current.qqAnswerApprovals && qqSubscriptions.has(sessionId),
+      )
+      if (qqNotify) {
+        void notifyQQ({
+          headline: '🔒 **需要权限审批**',
+          title: titleOf(session),
+          cwd: session.header && session.header.cwd ? session.header.cwd : '',
+          detail: `工具：${tool}\n（请回 DSH 处理；可在设置里开启「在 QQ 上回答审批」）`,
+        })
+      }
       return
     }
 
@@ -786,15 +1089,32 @@ export function apply(ctx, rawConfig) {
   ctx.on('tools/pre-execute', (exec, next) => {
     try {
       const current = cfg()
-      if (current.enabled && current.notifyOnQuestion && exec && exec.name === 'ask_user_question') {
+      if (exec && exec.name === 'ask_user_question') {
         const session = exec.agent ? ctx.sessions.get(exec.agent.id) : undefined
         const preview = questionPreview(exec.arguments)
-        show({
-          kind: 'question',
-          title: session ? titleOf(session) : '新对话',
-          subtitle: preview ? '需要你回答 · ' + preview : '需要你回答 · Agent 在等你',
-          sessionId: exec.agent ? exec.agent.id : '',
-        })
+        if (current.enabled && current.notifyOnQuestion) {
+          show({
+            kind: 'question',
+            title: session ? titleOf(session) : '新对话',
+            subtitle: preview ? '需要你回答 · ' + preview : '需要你回答 · Agent 在等你',
+            sessionId: exec.agent ? exec.agent.id : '',
+          })
+        }
+        // When QQ owns the answer it sends the question itself; a parallel
+        // "go answer in DSH" card would only be noise.
+        const qqNotify = Boolean(
+          current.qqEnabled
+            && !current.qqAnswerQuestions
+            && exec.agent
+            && qqSubscriptions.has(exec.agent.id),
+        )
+        if (qqNotify) {
+          void notifyQQ({
+            headline: '❓ **需要你回答**',
+            title: session ? titleOf(session) : '新对话',
+            detail: (preview ? `问题：${preview}\n` : '') + '（请回 DSH 回答；可在设置里开启「在 QQ 上回答提问」）',
+          })
+        }
       }
     } catch (error) {
       log('question notify failed', error)
