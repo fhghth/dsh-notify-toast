@@ -240,6 +240,25 @@ export function migrateQQState(raw) {
   }
 }
 
+/**
+ * Subscriptions whose session log is no longer on disk.
+ *
+ * Deletion has no trustworthy event: `session/disposed` also fires when a
+ * session merely leaves the in-memory store, so pruning on it would wipe every
+ * subscription on each restart. The session directory is the ground truth.
+ *
+ * An empty `existingIds` means the store could not be read, and pruning on an
+ * unreadable store would be catastrophic — so it prunes nothing.
+ *
+ * @param {Iterable<string>} subscriptionIds
+ * @param {Iterable<string>} existingIds session ids found under the session root
+ */
+export function selectDeletedSubscriptions(subscriptionIds, existingIds) {
+  const existing = existingIds instanceof Set ? existingIds : new Set(existingIds ?? [])
+  if (existing.size === 0) return []
+  return [...(subscriptionIds ?? [])].filter((sessionId) => sessionId && !existing.has(sessionId))
+}
+
 /** Cheap change detector so unchanged boards are never re-pushed. */
 export function panelSignature(items) {
   return JSON.stringify(Array.isArray(items) ? items : [])

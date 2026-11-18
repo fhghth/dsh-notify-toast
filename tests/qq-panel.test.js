@@ -19,6 +19,7 @@ import {
   formatCardHeader,
   migrateQQState,
   panelSignature,
+  selectDeletedSubscriptions,
   stateBadge,
   PANEL_DESC_LIMIT,
   PANEL_ITEM_LIMIT,
@@ -99,6 +100,18 @@ test('migrateQQState: tolerates garbage and old shapes', () => {
   )
   const legacy = migrateQQState({ subscriptions: { a: 1 } })
   assert.equal(legacy.subscriptions.a.alias, 1)
+})
+
+test('selectDeletedSubscriptions: only ids missing from the store are pruned', () => {
+  assert.deepEqual(
+    selectDeletedSubscriptions(['a', 'b', 'c'], ['a', 'c']),
+    ['b'],
+  )
+  assert.deepEqual(selectDeletedSubscriptions(['a'], new Set(['a'])), [])
+  // An unreadable/empty store must never wipe every subscription.
+  assert.deepEqual(selectDeletedSubscriptions(['a', 'b'], []), [])
+  assert.deepEqual(selectDeletedSubscriptions(['a'], undefined), [])
+  assert.deepEqual(selectDeletedSubscriptions(undefined, ['a']), [])
 })
 
 // ── card header ────────────────────────────────────────────────────────────

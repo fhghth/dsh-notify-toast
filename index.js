@@ -3,7 +3,7 @@
  * process over NDJSON, and relays "user clicked a card" to the page over SSE.
  */
 import path from 'node:path'
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -15,6 +15,7 @@ import {
   formatCardHeader,
   migrateQQState,
   panelSignature,
+  selectDeletedSubscriptions,
   stateBadge,
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
@@ -193,6 +194,8 @@ const NUM_KEYS = [
 const QQ_DATA_DIR = path.join(homedir(), '.dsh-notify-toast')
 const QQ_STATE_FILE = path.join(QQ_DATA_DIR, 'state.json')
 const QQ_LOCK_FILE = path.join(QQ_DATA_DIR, 'qqbot.lock')
+/** `<root>/<workspace>/session-<uuid>/session.v4.jsonl.zstd` — deletion removes the dir. */
+const SESSION_ROOT = path.join(homedir(), '.dsh', 'sessions')
 
 /** A passive reply anchor is only usable for 60 minutes and 4 replies. */
 const PASSIVE_WINDOW_MS = 55 * 60 * 1000
@@ -795,7 +798,10 @@ export function apply(ctx, rawConfig) {
 
     bot.on('state', (state) => {
       setQQStatus(state.state, state.detail)
-      if (state.state === 'ready') schedulePanelSync(1500)
+      if (state.state === 'ready') {
+        pruneDeletedSubscriptions()
+        schedulePanelSync(1500)
+      }
       if (state.state === 'fatal') {
         console.error('[notify-toast] QQ 网关致命错误:', state.detail)
       }
@@ -950,6 +956,57 @@ export function apply(ctx, rawConfig) {
   function forgetSession(sessionId) {
     if (sessionId) sessionStates.delete(sessionId)
     schedulePanelSync(500)
+  }
+
+  /** Session id out of whatever shape a lifecycle event carries. */
+  function sessionIdOf(payload) {
+    if (!payload) return undefined
+    if (typeof payload === 'string') return payload
+    if (typeof payload !== 'object') return undefined
+    return payload.sessionId ?? payload.id ?? (payload.session && payload.session.id) ?? undefined
+  }
+
+  /**
+   * Session ids that still have a log directory under the session root.
+   *
+   * Read-only and cached: a deletion has no trustworthy event (see the
+   * `session/disposed` note below), so the directory itself is the record.
+   */
+  let diskScan = { at: 0, ids: new Set() }
+  function sessionIdsOnDisk() {
+    if (Date.now() - diskScan.at < 60_000) return diskScan.ids
+    const ids = new Set()
+    try {
+      for (const workspace of readdirSync(SESSION_ROOT, { withFileTypes: true })) {
+        if (!workspace.isDirectory()) continue
+        const dir = path.join(SESSION_ROOT, workspace.name)
+        let entries = []
+        try {
+          entries = readdirSync(dir, { withFileTypes: true })
+        } catch {
+          continue
+        }
+        for (const entry of entries) {
+          if (entry.isDirectory() && entry.name.startsWith('session-')) ids.add(entry.name)
+        }
+      }
+    } catch {}
+    diskScan = { at: Date.now(), ids }
+    return ids
+  }
+
+  /** Drop subscriptions whose session was deleted from the store. */
+  function pruneDeletedSubscriptions() {
+    const gone = selectDeletedSubscriptions([...qqSubscriptions.keys()], sessionIdsOnDisk())
+    if (gone.length === 0) return
+    for (const sessionId of gone) {
+      qqSubscriptions.delete(sessionId)
+      releaseParkedDecision(sessionId)
+      sessionStates.delete(sessionId)
+    }
+    persistQQStateSoon()
+    schedulePanelSync()
+    log('pruned subscriptions for deleted sessions', gone.length)
   }
 
   function schedulePanelSync(delay = PANEL_SYNC_DEBOUNCE_MS) {
@@ -1369,7 +1426,8 @@ export function apply(ctx, rawConfig) {
   ].join('\n')
 
   async function handleList(message) {
-    // Looking at the list is the natural moment to make sure the board agrees.
+    // Looking at the list is the natural moment to reconcile it with the store.
+    pruneDeletedSubscriptions()
     schedulePanelSync()
     const rows = qqVisibleSessions()
     if (rows.length === 0) {
@@ -1611,17 +1669,31 @@ export function apply(ctx, rawConfig) {
 
   // A session that closes or gets archived leaves the board, but no turn event
   // will ever announce that — so listen to the lifecycle itself.
-  for (const eventName of ['session/disposed', 'workspace/session-archived']) {
-    try {
-      ctx.on(eventName, (payload) => {
-        const sessionId = payload && typeof payload === 'object'
-          ? payload.id ?? payload.sessionId ?? (payload.session && payload.session.id)
-          : undefined
-        forgetSession(sessionId)
-      })
-    } catch (error) {
-      log(`cannot listen to ${eventName}`, error)
-    }
+  //
+  // `session/disposed` must NOT drop the subscription: it also fires when a
+  // session merely leaves the in-memory store, i.e. every time it goes cold.
+  // Deleting a session is detected from the session store on disk instead.
+  try {
+    ctx.on('session/disposed', (payload) => {
+      forgetSession(sessionIdOf(payload))
+      // A real deletion removes the session directory; a session that merely
+      // went cold keeps it, so this is safe to run here.
+      pruneDeletedSubscriptions()
+    })
+  } catch (error) {
+    log('cannot listen to session/disposed', error)
+  }
+
+  // Archiving is an explicit user action, so the switch goes with it.
+  try {
+    ctx.on('workspace/session-archived', (payload) => {
+      const sessionId = sessionIdOf(payload)
+      if (!sessionId) return
+      subscribeQQ(sessionId, false)
+      forgetSession(sessionId)
+    })
+  } catch (error) {
+    log('cannot listen to workspace/session-archived', error)
   }
 
   ctx.on('session/event', (session, event) => {
@@ -2123,6 +2195,7 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => {
     loadQQState()
     backfillTitles()
+    pruneDeletedSubscriptions()
     startQQBridge()
     return () => {
       stopQQBridge()
