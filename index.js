@@ -846,16 +846,17 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Append the assistant's reply under a labelled heading.
+   * Append the assistant's reply under a divider line.
    *
-   * A bare `---` renders as a hairline that is easy to miss on a phone, so the
-   * break is spelled out with a bold label instead — it survives any markdown
-   * renderer and says what the block below actually is.
+   * `===` is not a markdown rule — a lone line of equals renders verbatim.
+   * It is kept on its own line *between blank lines* on purpose: directly
+   * under a paragraph markdown parsers read it as a setext H1 underline and
+   * would turn the previous line into a heading.
    */
-  function withBody(markdown, body, label = '本轮输出') {
+  function withBody(markdown, body) {
     const text = typeof body === 'string' ? body.trim() : ''
     if (!text) return markdown
-    return `${markdown}\n\n**📄 ${label}**\n\n${text}`
+    return `${markdown}\n\n===\n\n${text}`
   }
 
   /** Session events, or an empty list when the log is unavailable. */
@@ -1322,7 +1323,6 @@ export function apply(ctx, rawConfig) {
     const markdown = withBody(
       approvalCardText(sessionId, titleOf(session), request, commandOfCall(session, request.callId)),
       replyBodyPending(session),
-      'Agent 到目前为止的说明',
     )
     const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
@@ -1357,7 +1357,6 @@ export function apply(ctx, rawConfig) {
       withBody(
         questionCardText(sessionId, title, questions[0], 1, questions.length),
         replyBodyPending(session),
-        'Agent 到目前为止的说明',
       ),
       sessionId,
     )
