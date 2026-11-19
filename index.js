@@ -846,17 +846,16 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Append the assistant's reply under a divider line.
+   * Append the assistant's reply under a double rule.
    *
-   * `===` is not a markdown rule — a lone line of equals renders verbatim.
-   * It is kept on its own line *between blank lines* on purpose: directly
-   * under a paragraph markdown parsers read it as a setext H1 underline and
-   * would turn the previous line into a heading.
+   * Two `---` lines with a blank line between them read as one heavier divider
+   * than a single hairline. The blank line is required: adjacent `---` lines
+   * would be parsed as a setext heading underline instead of two rules.
    */
   function withBody(markdown, body) {
     const text = typeof body === 'string' ? body.trim() : ''
     if (!text) return markdown
-    return `${markdown}\n\n===\n\n${text}`
+    return `${markdown}\n\n---\n\n---\n\n${text}`
   }
 
   /** Session events, or an empty list when the log is unavailable. */
