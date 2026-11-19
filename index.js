@@ -584,7 +584,9 @@ export function apply(ctx, rawConfig) {
    * quoting the first card of a two-question batch would resolve the second.
    */
   const closedRefs = new Set()
-  const CLOSED_REF_LIMIT = 200
+  // Each ref_idx is a ~180-character encrypted blob, so this cap is a size
+  // decision rather than a correctness one: only recent cards can be tapped.
+  const CLOSED_REF_LIMIT = 50
 
   function loadQQState() {
     qqSubscriptions.clear()
@@ -1392,7 +1394,9 @@ export function apply(ctx, rawConfig) {
   function questionCardText(sessionId, title, question, index, total, chips = true) {
     // The kind is part of the heading, not a `问题：` prefix: on a phone the
     // first thing the user needs is whether one tap answers it or adds to it.
-    const kind = question.multiSelect ? '**多选：**' : '**单选：**'
+    // The colon stays outside the bold — QQ follows CommonMark's closing rule,
+    // so `**单选：**选项` never bolds while `**单选**：选项` does.
+    const kind = question.multiSelect ? '**多选**：' : '**单选**：'
     const lines = [
       cardHeader('❓', sessionId, title, `需要你回答（${index}/${total}）`),
       `${kind}${question.question}`,
