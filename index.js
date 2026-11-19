@@ -20,6 +20,7 @@ import {
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
 } from './qq-panel.js'
+import { fitMessage, pendingReplyText, turnReplyText } from './qq-reply.js'
 import {
   extractRefIdx,
   parseApprovalOutcome,
@@ -175,13 +176,14 @@ const DEFAULTS = {
   qqAutoResume: false,
   qqPanelEnabled: true,
   qqSubscriptionTtlDays: 30,
+  qqNotifyReply: false,
 }
 
 const BOOL_KEYS = [
   'enabled', 'notifyOnComplete', 'notifyOnApproval', 'notifyOnQuestion', 'notifyOnError',
   'soundEnabled', 'showElapsed', 'clickToOpenSession', 'debug',
   'qqEnabled', 'qqNotifyOnComplete', 'qqNotifyOnError',
-  'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume', 'qqPanelEnabled',
+  'qqAnswerApprovals', 'qqAnswerQuestions', 'qqAutoResume', 'qqPanelEnabled', 'qqNotifyReply',
 ]
 // `qqAutoResume` is kept in the schema so existing profiles still load, but it
 // no longer gates anything: since a subscribed session can be cold after a
@@ -205,6 +207,10 @@ const PASSIVE_MAX_REPLIES = 4
  * sends off. Anything else (network, auth) would just fail twice.
  */
 const FALLBACK_CODES = new Set([40034100, 40034105, 40054013])
+/** QQ rejects an over-long message with this code; retrying shorter beats losing it. */
+const TOO_LONG_CODES = new Set([40054007])
+/** Head+tail budget used only after the platform has already refused a card. */
+const MAX_CARD_CHARS = 3000
 /** Panel writes are 10 QPM, so never push them closer than this. */
 const PANEL_WRITE_GAP_MS = 7000
 /** Coalesce bursts of session events into one panel refresh. */
@@ -839,8 +845,46 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /** Append an assistant reply under a rule, when there is one. */
+  function withBody(markdown, body) {
+    const text = typeof body === 'string' ? body.trim() : ''
+    return text ? `${markdown}\n\n---\n\n${text}` : markdown
+  }
+
+  /** Session events, or an empty list when the log is unavailable. */
+  function safeEvents(session) {
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : []
+      return Array.isArray(events) ? events : []
+    } catch {
+      return []
+    }
+  }
+
+  /** The assistant's own words for the turn that just ended, when enabled. */
+  function replyBodyForTurn(session, endSeq) {
+    if (!cfg().qqNotifyReply) return ''
+    try {
+      return turnReplyText(safeEvents(session), endSeq)
+    } catch (error) {
+      log('qq reply extraction failed', error)
+      return ''
+    }
+  }
+
+  /** The assistant's words so far, for a decision card asked mid-turn. */
+  function replyBodyPending(session) {
+    if (!cfg().qqNotifyReply) return ''
+    try {
+      return pendingReplyText(safeEvents(session))
+    } catch (error) {
+      log('qq pending reply extraction failed', error)
+      return ''
+    }
+  }
+
   /** Send one programmatic card to every target. */
-  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, detail }) {
+  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, detail, body }) {
     if (!qq || qqStatus.state !== 'ready') return
     const targets = qqTargets()
     if (targets.length === 0) {
@@ -851,7 +895,7 @@ export function apply(ctx, rawConfig) {
     if (elapsed) lines.push(`用时：${elapsed}`)
     if (cwd) lines.push(`目录：${cwd}`)
     if (detail) lines.push(detail)
-    const markdown = lines.join('\n')
+    const markdown = withBody(lines.join('\n'), body)
     for (const openid of targets) {
       try {
         await sendCard(openid, { markdown, sessionId })
@@ -889,7 +933,7 @@ export function apply(ctx, rawConfig) {
     if (!qq || !openid || !markdown) return undefined
     let sent
     try {
-      sent = await qq.bot.sendC2C(openid, { markdown })
+      sent = await sendFitted(openid, markdown)
     } catch (error) {
       const code = error && typeof error === 'object' ? error.code : undefined
       const anchor = FALLBACK_CODES.has(code) ? passiveAnchorFor(openid) : undefined
@@ -901,6 +945,24 @@ export function apply(ctx, rawConfig) {
     // Quoting this card later routes the reply back to the same session.
     if (sent && sent.refIdx && sessionId) rememberSentCard(sent.refIdx, sessionId)
     return sent
+  }
+
+  /**
+   * Send once, and if the platform says it is too long, resend a head+tail
+   * cut. The card itself never pre-truncates, so a reply that fits goes out
+   * whole — the cost of getting this wrong is losing the notification.
+   */
+  async function sendFitted(openid, markdown) {
+    try {
+      return await qq.bot.sendC2C(openid, { markdown })
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : undefined
+      if (!TOO_LONG_CODES.has(code)) throw error
+      const fitted = fitMessage(markdown, MAX_CARD_CHARS)
+      if (!fitted.truncated) throw error
+      log(`qq card too long (${markdown.length} chars), retrying with ${fitted.text.length}`)
+      return qq.bot.sendC2C(openid, { markdown: fitted.text })
+    }
   }
 
   // ---- 指令面板: the session board ----------------------------------------
@@ -1192,11 +1254,9 @@ export function apply(ctx, rawConfig) {
     const session = request.agent.session
     const sessionId = session.id
     const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
-    const markdown = approvalCardText(
-      sessionId,
-      titleOf(session),
-      request,
-      commandOfCall(session, request.callId),
+    const markdown = withBody(
+      approvalCardText(sessionId, titleOf(session), request, commandOfCall(session, request.callId)),
+      replyBodyPending(session),
     )
     const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
@@ -1228,7 +1288,10 @@ export function apply(ctx, rawConfig) {
     const title = titleOf(session)
     const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
     const refIds = await sendCardToTargets(
-      questionCardText(sessionId, title, questions[0], 1, questions.length),
+      withBody(
+        questionCardText(sessionId, title, questions[0], 1, questions.length),
+        replyBodyPending(session),
+      ),
       sessionId,
     )
     if (!refIds) return undefined
@@ -1829,6 +1892,7 @@ export function apply(ctx, rawConfig) {
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
           elapsed: elapsedText,
           detail: error ? `错误：${error.code} ${error.message}` : '',
+          body: replyBodyForTurn(session, event.seq),
         })
       }
     }, Math.max(0, Number(current.settleMs) || 0))
