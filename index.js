@@ -845,10 +845,17 @@ export function apply(ctx, rawConfig) {
     })
   }
 
-  /** Append an assistant reply under a rule, when there is one. */
-  function withBody(markdown, body) {
+  /**
+   * Append the assistant's reply under a labelled heading.
+   *
+   * A bare `---` renders as a hairline that is easy to miss on a phone, so the
+   * break is spelled out with a bold label instead — it survives any markdown
+   * renderer and says what the block below actually is.
+   */
+  function withBody(markdown, body, label = '本轮输出') {
     const text = typeof body === 'string' ? body.trim() : ''
-    return text ? `${markdown}\n\n---\n\n${text}` : markdown
+    if (!text) return markdown
+    return `${markdown}\n\n**📄 ${label}**\n\n${text}`
   }
 
   /** Session events, or an empty list when the log is unavailable. */
@@ -1315,6 +1322,7 @@ export function apply(ctx, rawConfig) {
     const markdown = withBody(
       approvalCardText(sessionId, titleOf(session), request, commandOfCall(session, request.callId)),
       replyBodyPending(session),
+      'Agent 到目前为止的说明',
     )
     const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
@@ -1349,6 +1357,7 @@ export function apply(ctx, rawConfig) {
       withBody(
         questionCardText(sessionId, title, questions[0], 1, questions.length),
         replyBodyPending(session),
+        'Agent 到目前为止的说明',
       ),
       sessionId,
     )
