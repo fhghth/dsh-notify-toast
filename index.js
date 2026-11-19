@@ -825,6 +825,11 @@ export function apply(ctx, rawConfig) {
       }
       if (!openid || !message.msgId) return
       if (await routeInbound(message)) return
+      const hint = ambiguityHint()
+      if (hint) {
+        await replyQQ(openid, message.msgId, hint)
+        return
+      }
       await replyQQ(
         openid,
         message.msgId,
@@ -834,6 +839,15 @@ export function apply(ctx, rawConfig) {
           '支持：`#别名 内容` 投递、`/s 别名` 查看状态、`/ls` 列出会话。',
         ].join('\n'),
       )
+    })
+
+    // Anything the gateway dispatches that is not a message arrives here — the
+    // button callbacks (`INTERACTION_CREATE`) among them.
+    bot.on('event', (event) => {
+      if (!event || event.t !== 'INTERACTION_CREATE') return
+      void handleInteraction(event.raw).catch((error) => {
+        log('qq interaction handler failed', error && error.message ? error.message : error)
+      })
     })
 
     qq = { bot, stop: () => bot.stop() }
@@ -1271,16 +1285,70 @@ export function apply(ctx, rawConfig) {
     return undefined
   }
 
-  function approvalCardText(sessionId, title, request, command) {
+  /**
+   * One 文本交互 chip, in its two flavours.
+   *
+   * `cmd-enter` displays exactly what it sends and fires on a single tap;
+   * `cmd-input` displays `show` and only inserts `text` into the composer. The
+   * platform refuses `show` on `cmd-enter` (40034108 "qqbot-cmd-enter不支持show"),
+   * so a chip that must display one thing and send another has to be
+   * `cmd-input`.
+   *
+   * Constraints from the platform page: markdown messages only (we always send
+   * markdown), c2c only, `text`/`show` capped at 100 characters and required to
+   * be urlencoded. One invalid tag rejects the whole message, which is why every
+   * card is built twice and sent with a plain fallback.
+   */
+  function cmdChip(text) {
+    return `<qqbot-cmd-enter text="${encodeURIComponent(text)}" />`
+  }
+
+  /** Insert-only chip: shows `show`, puts `text` in the composer, sends nothing. */
+  function cmdInsert(text, show) {
+    return (
+      `<qqbot-cmd-input text="${encodeURIComponent(text)}"` +
+      ` show="${encodeURIComponent(show ?? text)}" reference="true" />`
+    )
+  }
+
+  /** The free-text door — the input box the DSH panel always offers. */
+  const OTHER_LABEL = '其他'
+  const OTHER_PREFIX = `${OTHER_LABEL}：`
+
+  /**
+   * One option row.
+   *
+   * The chip carries the option's own label, because that is what the client
+   * displays and sends — the plugin maps the label straight back onto the
+   * option, so the question itself is unchanged. Multi-select inserts instead of
+   * sending, so repeated taps compose into `A,B`; the trailing comma is what
+   * keeps them from running together.
+   */
+  function optionRow(option, index, question, chips) {
+    const label = String(option?.label ?? '').trim()
+    const note = option?.description ? `：${option.description}` : ''
+    if (!chips) return `${index + 1}. ${label}${note}`
+    if (question?.multiSelect) return `${cmdInsert(`${label},`, label)}${note}`
+    return `${cmdChip(label)}${note}`
+  }
+
+  function approvalCardText(sessionId, title, request, command, chips = true) {
     const lines = [cardHeader('🔒', sessionId, title, '需要权限审批')]
     if (request?.toolName) lines.push(`工具：${request.toolName}`)
     if (command) lines.push('命令：\n```\n' + command + '\n```')
     if (request?.reason) lines.push(`原因：${request.reason}`)
-    lines.push('', '回复 **ok** 允许一次，**no** 拒绝')
+    lines.push('')
+    if (chips) {
+      lines.push(cmdChip('允许一次'))
+      lines.push(cmdChip('拒绝'))
+      lines.push('', '点一下直接答复，也可以回复 **ok** / **no**')
+    } else {
+      lines.push('回复 **ok** 允许一次，**no** 拒绝')
+    }
     return lines.join('\n')
   }
 
-  function questionCardText(sessionId, title, question, index, total) {
+  function questionCardText(sessionId, title, question, index, total, chips = true) {
     const lines = [
       cardHeader('❓', sessionId, title, `需要你回答（${index}/${total}）`),
       `问题：${question.question}`,
@@ -1288,12 +1356,18 @@ export function apply(ctx, rawConfig) {
     const options = Array.isArray(question.options) ? question.options : []
     if (options.length > 0) {
       lines.push('')
-      options.forEach((option, i) => {
-        // `：` keeps the line shorter than ` — `, which matters because a long
-      // description wraps mid-line on a phone.
-      lines.push(`${i + 1}. ${option.label}${option.description ? `：${option.description}` : ''}`)
-      })
-      lines.push('', question.multiSelect ? '回复编号选择（多选用逗号），或直接输入文字' : '回复编号选择，或直接输入文字')
+      options.forEach((option, i) => lines.push(optionRow(option, i, question, chips)))
+      if (chips) lines.push(cmdInsert(OTHER_PREFIX, OTHER_LABEL))
+      lines.push('')
+      if (question.multiSelect) {
+        lines.push(
+          chips
+            ? '点选项会填进输入框，可连点多个再发送；也可直接回复编号（如 1,3）'
+            : '回复编号选择（多选用逗号），或直接输入文字',
+        )
+      } else {
+        lines.push(chips ? '点选项直接作答；也可以回复编号或输入文字' : '回复编号选择，或直接输入文字')
+      }
     } else {
       lines.push('', '直接输入你的回答')
     }
@@ -1319,16 +1393,34 @@ export function apply(ctx, rawConfig) {
     return delivered ? refIds : undefined
   }
 
+  /**
+   * Send a decision card, degrading to its plain version when the platform
+   * rejects a 文本交互 tag.
+   *
+   * One invalid tag rejects the whole message (40034108 does exactly that), and
+   * losing the question is far worse than losing the tap affordance — so the
+   * chip card is never the only copy in flight.
+   */
+  async function sendDecisionCard(chipMarkdown, plainMarkdown, sessionId) {
+    const sent = await sendCardToTargets(chipMarkdown, sessionId)
+    if (sent) return sent
+    if (!plainMarkdown || plainMarkdown === chipMarkdown) return undefined
+    log('qq decision card rejected, retrying without 文本交互 tags')
+    return await sendCardToTargets(plainMarkdown, sessionId)
+  }
+
   async function parkApproval(request) {
     const session = request.agent.session
     const sessionId = session.id
     const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
-    const markdown = withBody(
-      approvalCardText(sessionId, titleOf(session), request, commandOfCall(session, request.callId)),
-      replyBodyPending(session),
-      'Agent 到目前为止的说明',
+    const command = commandOfCall(session, request.callId)
+    const body = replyBodyPending(session)
+    const title = titleOf(session)
+    const refIds = await sendDecisionCard(
+      withBody(approvalCardText(sessionId, title, request, command, true), body, 'Agent 到目前为止的说明'),
+      withBody(approvalCardText(sessionId, title, request, command, false), body, 'Agent 到目前为止的说明'),
+      sessionId,
     )
-    const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
 
     const entry = { sessionId, alias, request, refIds, resolve: () => {}, onAbort: undefined }
@@ -1357,12 +1449,10 @@ export function apply(ctx, rawConfig) {
     if (questions.length === 0) return undefined
     const title = titleOf(session)
     const alias = qqSubscriptions.get(sessionId)?.alias ?? 0
-    const refIds = await sendCardToTargets(
-      withBody(
-        questionCardText(sessionId, title, questions[0], 1, questions.length),
-        replyBodyPending(session),
-        'Agent 到目前为止的说明',
-      ),
+    const body = replyBodyPending(session)
+    const refIds = await sendDecisionCard(
+      withBody(questionCardText(sessionId, title, questions[0], 1, questions.length, true), body, 'Agent 到目前为止的说明'),
+      withBody(questionCardText(sessionId, title, questions[0], 1, questions.length, false), body, 'Agent 到目前为止的说明'),
       sessionId,
     )
     if (!refIds) return undefined
@@ -1447,8 +1537,11 @@ export function apply(ctx, rawConfig) {
     entry.index += 1
     if (entry.index < entry.request.questions.length) {
       const next = entry.request.questions[entry.index]
-      const refIds = await sendCardToTargets(
-        questionCardText(entry.sessionId, entry.title, next, entry.index + 1, entry.request.questions.length),
+      const total = entry.request.questions.length
+      const nth = entry.index + 1
+      const refIds = await sendDecisionCard(
+        questionCardText(entry.sessionId, entry.title, next, nth, total, true),
+        questionCardText(entry.sessionId, entry.title, next, nth, total, false),
         entry.sessionId,
       )
       if (refIds) entry.refIds.push(...refIds)
@@ -1556,9 +1649,10 @@ export function apply(ctx, rawConfig) {
     '/s 3 查看会话 #3 的状态',
     '#3 内容 发送到会话 #3',
     '/off 3 取消会话 #3 的 QQ 通知',
+    '/a3 1 回答会话 #3 的待处理提问（卡片上的标签就是它）',
     '/status 通道状态',
     '指令面板里点任意一项，即可直接切到那个会话',
-    '审批 / 提问：直接回 ok / no / 编号，或引用那张卡片回复',
+    '审批 / 提问：点卡片上的标签，或直接回 ok / no / 编号',
   ].join('\n')
 
   async function handleList(message) {
@@ -1656,11 +1750,254 @@ export function apply(ctx, rawConfig) {
     )
   }
 
+  // ---- message buttons ----------------------------------------------------
+  //
+  // A QQ inline keyboard only mounts on a markdown message, and only 5 rows of
+  // 5 buttons fit. `action.type` decides what a tap does:
+  //
+  //   0 = 跳转   open a URL, no callback at all
+  //   1 = 回调   the platform pushes INTERACTION_CREATE to us; we must PUT an
+  //              ack within 3 seconds or the client spins until it times out
+  //   2 = 指令   the client types `data` into the composer and sends it
+  //
+  // Only type=1 can carry a decision back without spending a message, so that
+  // is what a question or approval card would use.
+  const BUTTON_UNSUPPORTED = '当前 QQ 版本不支持按钮，请改用文字回复'
+
+  function qqButton(id, label, data, options = {}) {
+    const { style = 1, actionType = 1, visited } = options
+    return {
+      id,
+      render_data: { label, visited_label: visited ?? label, style },
+      action: {
+        type: actionType,
+        // type 2 = 所有人. The empty id lists mirror the official example; some
+        // platform versions reject the field set when they are absent.
+        permission: { type: 2, specify_user_ids: [], specify_role_ids: [] },
+        data,
+        unsupport_tips: BUTTON_UNSUPPORTED,
+      },
+    }
+  }
+
+  /**
+   * `/kbtest` — one message that answers "may this bot mount buttons at all?".
+   *
+   * Custom keyboards are documented as 内邀开通, so the only authority is the
+   * platform itself. Two callback buttons prove the interaction round trip;
+   * one 指令 button proves the no-callback alternative in the same message.
+   */
+  async function handleKeyboardProbe(message) {
+    if (!qq || qqStatus.state !== 'ready') {
+      await replyQQ(message.openid, message.msgId, `QQ 通道未就绪（${qqStatus.state}）`)
+      return
+    }
+    const keyboard = {
+      content: {
+        rows: [
+          {
+            buttons: [
+              qqButton('kb-one', '✅ 回调按钮一', 'kbtest:1'),
+              qqButton('kb-two', '回调按钮二', 'kbtest:2', { style: 0 }),
+            ],
+          },
+          { buttons: [qqButton('kb-cmd', '⌨️ 指令按钮 /status', '/status', { actionType: 2 })] },
+        ],
+      },
+    }
+    const markdown = [
+      '**🔘 消息按钮探针**',
+      '',
+      '这条消息带了 `keyboard` 字段。',
+      '第 1 行两个**回调按钮**：点了这里应该自动回一条确认。',
+      '第 2 行一个**指令按钮**：点了会自动替用户发出 `/status`。',
+      '',
+      '如果一个按钮都没出来，说明这个机器人拿不到自定义按钮权限。',
+    ].join('\n')
+    try {
+      await qq.bot.sendC2C(message.openid, { markdown, keyboard, msgId: message.msgId })
+      log('qq keyboard probe sent')
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : undefined
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `按钮消息被拒：code=\`${code ?? '?'}\`\n${error && error.message ? error.message : error}`,
+      )
+    }
+  }
+
+  /**
+   * Ack a button tap, then act on it.
+   *
+   * The ack is unconditional and comes first: any throw or slow await before it
+   * leaves the user staring at a loading spinner, and the same
+   * `interaction_id` cannot be acked twice.
+   */
+  async function handleInteraction(data) {
+    const interactionId = data && data.id
+    const resolved = (data && data.data && data.data.resolved) || {}
+    const buttonData = resolved.button_data
+    const openid = data && data.user_openid
+    const type = Number(data && data.type)
+    log(`qq interaction type=${type} button=${resolved.button_id ?? '?'} data=${buttonData ?? '?'}`)
+    if (interactionId && qq) {
+      try {
+        await qq.bot.request('PUT', `/interactions/${encodeURIComponent(interactionId)}`, { code: 0 })
+      } catch (error) {
+        log('qq interaction ack failed', error && error.message ? error.message : error)
+      }
+    }
+    // 11 = 消息按钮; the rest (feedback, clear-session, authorize) need no reply.
+    if (type !== 11 || !openid || !buttonData || !qq) return
+    try {
+      // `event_id` accepts the interaction's own id, so the tap gets a passive
+      // reply without spending the user's proactive quota.
+      await qq.bot.sendC2C(openid, {
+        markdown: `收到按钮 ✅\n\ndata = \`${buttonData}\`\nbutton_id = \`${resolved.button_id ?? '?'}\``,
+        eventId: interactionId,
+      })
+    } catch (error) {
+      log('qq interaction reply failed', error && error.message ? error.message : error)
+    }
+  }
+
+  /**
+   * `/txttest` — does this client render 文本交互 tags?
+   *
+   * `<qqbot-cmd-enter>` is pure markdown: no keyboard, no callback URL, no
+   * interaction ack, no public endpoint. The client either draws a tappable
+   * `/cmd` chip or prints the raw tag, and the raw tag is a harmless fallback.
+   *
+   * Constraints from the official page: markdown only (we always send
+   * markdown), c2c only (群聊 and 文字子频道 refuse `cmd-enter`), `text` and
+   * `show` capped at 100 chars and required to be urlencoded.
+   */
+  async function handleTextChainProbe(message) {
+    if (!qq || qqStatus.state !== 'ready') {
+      await replyQQ(message.openid, message.msgId, `QQ 通道未就绪（${qqStatus.state}）`)
+      return
+    }
+    const enter = (text) => `<qqbot-cmd-enter text="${encodeURIComponent(text)}" />`
+    const insert = (text, show) =>
+      `<qqbot-cmd-input text="${encodeURIComponent(text)}" show="${encodeURIComponent(show)}" reference="true" />`
+    const markdown = [
+      '**🧪 文本交互探针**',
+      '',
+      `1. 应立刻发出 \`/status\`：${enter('/status')}`,
+      `2. 应发出**带空格**的 \`/s 3\`：${enter('/s 3')}`,
+      `3. 应只填进输入框、显示中文：${insert('/ls', '列表')}`,
+      '',
+      '三行都变成可点的 `/xxx` 标签 = 文本交互可用。',
+      '看到 `<qqbot-cmd-enter text=…>` 这样的原文 = 不支持。',
+    ].join('\n')
+    try {
+      await qq.bot.sendC2C(message.openid, { markdown, msgId: message.msgId })
+      log('qq text-chain probe sent')
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : undefined
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `文本交互消息被拒：code=\`${code ?? '?'}\`\n${error && error.message ? error.message : error}`,
+      )
+    }
+  }
+
+  /**
+   * `/a3 1` — resolve session #3's parked decision.
+   *
+   * This is the target of every chip a card mounts, so it has to be strict: an
+   * unknown alias, a released alias, or a session with nothing parked all get
+   * an explicit answer rather than a guess. The alias pins the session, so the
+   * bare `1` a user might type stays available as the "only pending decision"
+   * shortcut.
+   */
+  async function handleAnswerCommand(command, message) {
+    const alias = command.alias
+    const value = command.value
+    if (!Number.isInteger(alias) || alias <= 0 || !value) {
+      await replyQQ(message.openid, message.msgId, '用法：/a3 1（会话 #3 的第 1 项）')
+      return
+    }
+    const sessionId = aliasToSessionMap().get(alias)
+    if (!sessionId) {
+      await replyQQ(message.openid, message.msgId, `没有 #${alias} 这个会话，发送 /ls 查看`)
+      return
+    }
+    const approval = pendingApprovals.get(sessionId)
+    if (approval) {
+      return answerPending({ kind: 'approval', entry: approval, payload: value }, value, message)
+    }
+    const question = pendingQuestions.get(sessionId)
+    if (question) {
+      return answerPending({ kind: 'question', entry: question, payload: value }, value, message)
+    }
+    await replyQQ(message.openid, message.msgId, `#${alias} 现在没有待处理的审批或提问`)
+  }
+
+  /**
+   * `/chipprobe` — settle the one unknown the card layout depends on.
+   *
+   * The whole "option name is the tap target" design needs `cmd-enter` to honour
+   * `show` the way `cmd-input` does: display the friendly text, send the token.
+   * The official page only documents `show` for `cmd-input`, so the client is
+   * the only authority.
+   *
+   * Four lines, one message:
+   *   1  enter + show   -> does it display the label instead of the token?
+   *   2  input + show   -> control, already known to work
+   *   3  input "3,"     -> does a separator make repeated taps compose?
+   *   4  input "其他："  -> does multi-byte text insert cleanly?
+   */
+  async function handleChipProbe(message) {
+    if (!qq || qqStatus.state !== 'ready') {
+      await replyQQ(message.openid, message.msgId, `QQ 通道未就绪（${qqStatus.state}）`)
+      return
+    }
+    const enter = (text, show) =>
+      `<qqbot-cmd-enter text="${encodeURIComponent(text)}" show="${encodeURIComponent(show)}" />`
+    const insert = (text, show) =>
+      `<qqbot-cmd-input text="${encodeURIComponent(text)}" show="${encodeURIComponent(show)}" />`
+    const markdown = [
+      '**🧪 结构探针 · 四条**',
+      '',
+      '**1. enter + show** —— 期望显示 `/A（推荐）`，点一下立刻收到通道状态卡',
+      enter('/status', 'A（推荐）'),
+      '',
+      '**2. input + show** —— 期望显示 `/B`，点一下只填入 `/status`，不发送',
+      insert('/status', 'B'),
+      '',
+      '**3. 连点三下** —— 期望显示 `/C`，连点三次输入框变成 `3,3,3,`',
+      insert('3,', 'C'),
+      '',
+      '**4. 中文插入** —— 期望显示 `/其他`，点一下输入框出现 `其他：`',
+      insert('其他：', '其他'),
+      '',
+      '第 1 条是不是显示成 `/A（推荐）`，决定选项能不能既好看又一点即答。',
+    ].join('\n')
+    try {
+      await qq.bot.sendC2C(message.openid, { markdown, msgId: message.msgId })
+      log('qq chip probe sent')
+    } catch (error) {
+      const code = error && typeof error === 'object' ? error.code : undefined
+      await replyQQ(
+        message.openid,
+        message.msgId,
+        `探针消息被拒：code=\`${code ?? '?'}\`\n${error && error.message ? error.message : error}`,
+      )
+    }
+  }
+
   async function handleCommand(command, message) {
     if (command.command === 'ls') return handleList(message)
     if (command.command === 'status') return handleStatus(message)
     if (command.command === 's') return handleShow(command, message)
     if (command.command === 'off') return handleOff(command, message)
+    if (command.command === 'answer') return handleAnswerCommand(command, message)
+    if (command.command === 'kbtest') return handleKeyboardProbe(message)
+    if (command.command === 'txttest') return handleTextChainProbe(message)
+    if (command.command === 'chipprobe') return handleChipProbe(message)
     return replyQQ(message.openid, message.msgId, HELP_TEXT)
   }
 
@@ -1769,6 +2106,23 @@ export function apply(ctx, rawConfig) {
       return true
     }
     return false
+  }
+
+  /**
+   * Why an otherwise unrouteable message still gets a reply.
+   *
+   * A single-choice chip is `cmd-enter`, which carries no quote and no alias —
+   * the client offers neither — so its label only resolves when exactly one
+   * decision is pending. Rather than dropping such a reply into the help text,
+   * say what is wrong and how to address it.
+   */
+  function ambiguityHint() {
+    const pending = pendingApprovals.size + pendingQuestions.size
+    if (pending < 2) return undefined
+    return (
+      `现在有 ${pending} 个待处理决策，认不出这句对应哪一个。\n` +
+      '请用 **/a别名 答案** 指定（别名就是卡片标题上的 #N）。'
+    )
   }
 
   ctx.on('approval/request', async (req, next) => {

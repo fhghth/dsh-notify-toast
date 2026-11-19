@@ -11,8 +11,9 @@
  *   question (service)    { id, question, header?, options?: [{label, description?}], multiSelect? }
  */
 
-const ALLOW_WORDS = /^(ok|okay|yes|y|allow|允许|同意|批准|通过|可以|好|好的)$/i
-const DENY_WORDS = /^(no|n|nope|deny|reject|拒绝|驳回|不同意|不行|否)$/i
+const ALLOW_WORDS =
+  /^(ok|okay|yes|y|allow|approve|允许一次|允许|同意|批准|通过|可以|好|好的)$/i
+const DENY_WORDS = /^(no|n|nope|deny|reject|不允许|拒绝|驳回|不同意|不行|否)$/i
 
 /** @returns {'allowed-once' | 'rejected' | undefined} */
 export function parseApprovalOutcome(text) {
@@ -47,36 +48,74 @@ export function extractRefIdx(rawMessage) {
 }
 
 /**
+ * `其他：…` is the card's free-text door: the chip inserts the prefix and the
+ * user finishes the sentence, so everything after it is the custom answer. It
+ * can sit behind selected labels, because multiSelect lets both coexist.
+ */
+const CUSTOM_MARK = /(?:^|[,，\s]+)(?:其他|自定义|custom)\s*[:：]\s*/i
+
+/**
+ * Match one answer token against the offered options.
+ *
+ * The card mounts each option's own label as its chip, and `cmd-enter` displays
+ * exactly what it sends, so a label comes back verbatim. Numbers stay supported
+ * because a user can still type them.
+ */
+function matchOption(options, token) {
+  const index = Number(token)
+  if (Number.isInteger(index) && index >= 1 && index <= options.length) return options[index - 1]
+  const needle = String(token ?? '').trim().toLowerCase()
+  if (!needle) return undefined
+  return options.find((option) => String(option?.label ?? '').trim().toLowerCase() === needle)
+}
+
+/**
  * Map a reply onto DSH's structured question answer.
  *
- * Numbers select offered options (`1`, `1,3` for multiSelect, Chinese commas
- * accepted); anything else is a free-form answer. Out-of-range numbers fall
- * back to free text rather than silently choosing the wrong option.
+ * Accepts a 1-based index (`1`, `1,3` for multiSelect, Chinese commas too) or an
+ * option label exactly as the chip sent it. Anything unrecognised is a free-form
+ * answer — never a guess, because silently picking an option answers a question
+ * the user did not answer.
+ *
+ * DSH's own rules are preserved: a `custom` text replaces the selection on a
+ * single-choice question, and supplements it on a multiSelect.
  *
  * @param {{ id: string, options?: Array<{ label: string }>, multiSelect?: boolean }} question
  * @param {string} text
  */
 export function parseQuestionAnswer(question, text) {
-  const value = String(text ?? '').trim()
+  const raw = String(text ?? '').trim()
   const id = question?.id
   const options = Array.isArray(question?.options) ? question.options : []
-  if (options.length === 0) return { id, selected: [], custom: value }
+  if (!raw) return { id, selected: [] }
+  if (options.length === 0) return { id, selected: [], custom: raw }
 
-  const parts = value.split(/[,，\s]+/).filter(Boolean)
+  let body = raw
+  let custom
+  const mark = CUSTOM_MARK.exec(raw)
+  if (mark) {
+    body = raw.slice(0, mark.index)
+    custom = raw.slice(mark.index + mark[0].length).trim() || undefined
+  }
+
   const chosen = []
-  let numeric = parts.length > 0
-  for (const part of parts) {
-    const index = Number(part)
-    if (!Number.isInteger(index) || index < 1 || index > options.length) {
-      numeric = false
-      break
+  if (body) {
+    const tokens = body.split(/[,，\s]+/).map((token) => token.trim()).filter(Boolean)
+    for (const token of tokens) {
+      const option = matchOption(options, token)
+      if (!option) return { id, selected: [], custom: raw }
+      chosen.push(option.label)
     }
-    chosen.push(options[index - 1].label)
   }
-  if (numeric && chosen.length > 0) {
-    return { id, selected: question?.multiSelect ? chosen : [chosen[0]] }
+
+  if (chosen.length === 0) {
+    return custom === undefined ? { id, selected: [] } : { id, selected: [], custom }
   }
-  return { id, selected: [], custom: value }
+  const unique = [...new Set(chosen)]
+  const selected = question?.multiSelect ? unique : [unique[0]]
+  if (custom === undefined) return { id, selected }
+  // Single choice: the free text replaces the pick. Multi: it rides along.
+  return question?.multiSelect ? { id, selected, custom } : { id, selected: [], custom }
 }
 
 function findByRef(entries, refIdx) {
@@ -169,7 +208,7 @@ const BARE_COMMAND = /^(s|show|ls|list|status|off|help)(?:\s+(\d+))?$/i
  * needing any push message.
  *
  * @param {string} text
- * @returns {{ command: 'ls' | 'status' | 'off' | 's' | 'help', alias?: number } | undefined}
+ * @returns {{ command: 'ls' | 'status' | 'off' | 's' | 'kbtest' | 'txttest' | 'chipprobe' | 'answer' | 'help', alias?: number, value?: string } | undefined}
  */
 export function parseCommand(text) {
   const value = String(text ?? '').trim()
@@ -187,6 +226,14 @@ export function parseCommand(text) {
   const argument = rest.join(' ').trim()
   if (name === 'ls' || name === 'list') return { command: 'ls' }
   if (name === 'status') return { command: 'status' }
+  if (name === 'kbtest') return { command: 'kbtest' }
+  if (name === 'txttest') return { command: 'txttest' }
+  if (name === 'chipprobe') return { command: 'chipprobe' }
+  // `/a3 1` is what a card's 文本交互 chip sends: one tap, one message, no
+  // callback endpoint. The alias pins the session so it cannot be guessed
+  // wrong; the value is whatever the card put there (`1`, `ok`, `no`).
+  const targeted = /^a(\d+)$/.exec(name)
+  if (targeted) return { command: 'answer', alias: Number(targeted[1]), value: argument }
   if (name === 'show' || name === 's') {
     const alias = Number(argument)
     return { command: 's', alias: Number.isInteger(alias) && alias > 0 ? alias : undefined }

@@ -16,10 +16,10 @@ import {
 } from '../qq-answer.js'
 
 test('approval words map onto the DSH outcome vocabulary', () => {
-  for (const word of ['ok', 'OK', 'yes', '允许', '同意', '批准', '通过']) {
+  for (const word of ['ok', 'OK', 'yes', '允许', '允许一次', '同意', '批准', '通过']) {
     assert.equal(parseApprovalOutcome(word), 'allowed-once', word)
   }
-  for (const word of ['no', 'No', 'reject', '拒绝', '驳回', '不同意']) {
+  for (const word of ['no', 'No', 'reject', '拒绝', '不允许', '驳回', '不同意']) {
     assert.equal(parseApprovalOutcome(word), 'rejected', word)
   }
   assert.equal(parseApprovalOutcome('也许吧'), undefined)
@@ -52,6 +52,56 @@ test('question answers: numbers select options, text becomes custom', () => {
 
   const free = { id: 'q2' }
   assert.deepEqual(parseQuestionAnswer(free, '你好'), { id: 'q2', selected: [], custom: '你好' })
+})
+
+test('question answers: a chip sends the option label verbatim', () => {
+  const question = {
+    id: 'q1',
+    options: [{ label: '方案一（推荐）' }, { label: '方案二' }, { label: '方案三' }],
+  }
+  // cmd-enter shows exactly what it sends, so the label is the token.
+  assert.deepEqual(parseQuestionAnswer(question, '方案二'), { id: 'q1', selected: ['方案二'] })
+  assert.deepEqual(parseQuestionAnswer(question, '方案一（推荐）'), {
+    id: 'q1',
+    selected: ['方案一（推荐）'],
+  })
+
+  const multi = { ...question, multiSelect: true }
+  // Multi-select inserts `label,` per tap, so the composer holds a list.
+  assert.deepEqual(parseQuestionAnswer(multi, '方案一（推荐）,方案三,'), {
+    id: 'q1',
+    selected: ['方案一（推荐）', '方案三'],
+  })
+  // Tapping the same chip twice must not duplicate the answer.
+  assert.deepEqual(parseQuestionAnswer(multi, '方案二,方案二,'), {
+    id: 'q1',
+    selected: ['方案二'],
+  })
+})
+
+test('question answers: 其他 opens the free-text door', () => {
+  const question = { id: 'q1', options: [{ label: '方案一' }, { label: '方案二' }] }
+  assert.deepEqual(parseQuestionAnswer(question, '其他：我自己写一个'), {
+    id: 'q1',
+    selected: [],
+    custom: '我自己写一个',
+  })
+  // Bare prefix with nothing typed is a skip, not an empty custom answer.
+  assert.deepEqual(parseQuestionAnswer(question, '其他：'), { id: 'q1', selected: [] })
+
+  const multi = { ...question, multiSelect: true }
+  // MultiSelect may carry both: the seam allows custom alongside selected.
+  assert.deepEqual(parseQuestionAnswer(multi, '方案一,其他：补充说明'), {
+    id: 'q1',
+    selected: ['方案一'],
+    custom: '补充说明',
+  })
+  // Single choice: the free text replaces the pick, per the seam.
+  assert.deepEqual(parseQuestionAnswer(question, '方案一,其他：补充说明'), {
+    id: 'q1',
+    selected: [],
+    custom: '补充说明',
+  })
 })
 
 const approval = (alias, refIds = []) => ({ alias, refIds })
@@ -123,6 +173,13 @@ test('commands: slash commands parse independently of pending decisions', () => 
   assert.deepEqual(parseCommand('/off 3'), { command: 'off', alias: 3 })
   assert.deepEqual(parseCommand('/off'), { command: 'off', alias: undefined })
   assert.deepEqual(parseCommand('/wat'), { command: 'help' })
+  assert.deepEqual(parseCommand('/kbtest'), { command: 'kbtest' })
+  assert.deepEqual(parseCommand('/txttest'), { command: 'txttest' })
+  assert.deepEqual(parseCommand('/chipprobe'), { command: 'chipprobe' })
+  assert.deepEqual(parseCommand('/a3 1'), { command: 'answer', alias: 3, value: '1' })
+  assert.deepEqual(parseCommand('/a12 ok'), { command: 'answer', alias: 12, value: 'ok' })
+  assert.deepEqual(parseCommand('/a3'), { command: 'answer', alias: 3, value: '' })
+  assert.equal(parseCommand('kbtest'), undefined)
   assert.equal(parseCommand('ok'), undefined)
 })
 
