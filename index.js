@@ -846,16 +846,18 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Append the assistant's reply under a double rule.
+   * Append the assistant's reply between two rules, with a caption line.
    *
-   * Two `---` lines with a blank line between them read as one heavier divider
-   * than a single hairline. The blank line is required: adjacent `---` lines
-   * would be parsed as a setext heading underline instead of two rules.
+   * QQ's markdown has no alignment primitive (no HTML, no `align`), so the
+   * caption is "centred" the only way that renders everywhere: symmetric
+   * decoration on both sides. The blank lines between the `---` marks are
+   * required — adjacent rules would be parsed as a setext heading underline.
    */
-  function withBody(markdown, body) {
+  function withBody(markdown, body, label = '本轮输出') {
     const text = typeof body === 'string' ? body.trim() : ''
     if (!text) return markdown
-    return `${markdown}\n\n---\n\n---\n\n${text}`
+    const caption = label ? `── 📄 ${label} ──\n\n` : ''
+    return `${markdown}\n\n---\n\n${caption}---\n\n${text}`
   }
 
   /** Session events, or an empty list when the log is unavailable. */
@@ -1322,6 +1324,7 @@ export function apply(ctx, rawConfig) {
     const markdown = withBody(
       approvalCardText(sessionId, titleOf(session), request, commandOfCall(session, request.callId)),
       replyBodyPending(session),
+      'Agent 到目前为止的说明',
     )
     const refIds = await sendCardToTargets(markdown, sessionId)
     if (!refIds) return undefined
@@ -1356,6 +1359,7 @@ export function apply(ctx, rawConfig) {
       withBody(
         questionCardText(sessionId, title, questions[0], 1, questions.length),
         replyBodyPending(session),
+        'Agent 到目前为止的说明',
       ),
       sessionId,
     )
