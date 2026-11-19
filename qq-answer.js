@@ -134,6 +134,28 @@ function findByAlias(entries, alias) {
 }
 
 /**
+ * Does this reply carry the label of an option the user already answered?
+ *
+ * The single-choice chips are `cmd-enter`, which can carry neither a quote nor
+ * an alias, so the only thing that identifies them is the label itself. Once
+ * the question closes the label is stale, and without this check the reply
+ * would be recorded as a brand-new answer — or worse, as free text.
+ *
+ * A label that the *current* question also offers is not stale: tapping that
+ * card again is a legitimate re-answer.
+ *
+ * @param {string} text reply body
+ * @param {Set<string> | undefined} closed lowercased labels of settled questions
+ * @param {{ options?: Array<{ label: string }> }} [question] the question being answered now
+ */
+export function isClosedLabel(text, closed, question) {
+  const value = String(text ?? '').trim().toLowerCase()
+  if (!value || !closed || !closed.has(value)) return false
+  const options = Array.isArray(question?.options) ? question.options : []
+  return !options.some((option) => String(option?.label ?? '').trim().toLowerCase() === value)
+}
+
+/**
  * Decide which parked decision one inbound message answers.
  *
  * Precedence: the quoted card, then an explicit `#alias` prefix, then the only
@@ -143,10 +165,11 @@ function findByAlias(entries, alias) {
  * @param {Iterable<any>} input.approvals parked approvals, each `{ alias, refIds }`
  * @param {Iterable<any>} input.questions parked questions, each `{ alias, refIds }`
  * @param {string} [input.refIdx] quoted card index from {@link extractRefIdx}
+ * @param {Set<string>} [input.closedRefs] ref_idx values of cards already settled
  * @param {string} input.text reply text
- * @returns {{ kind: 'approval' | 'question', entry: any, payload: string } | undefined}
+ * @returns {{ kind: 'approval' | 'question' | 'stale', entry: any, payload: string } | undefined}
  */
-export function selectPendingDecision({ approvals, questions, refIdx, text }) {
+export function selectPendingDecision({ approvals, questions, refIdx, closedRefs, text }) {
   const approvalsList = [...approvals]
   const questionsList = [...questions]
   const value = String(text ?? '').trim()
@@ -164,6 +187,10 @@ export function selectPendingDecision({ approvals, questions, refIdx, text }) {
       entry = findByRef(questionsList, refIdx)
       if (entry) kind = 'question'
     }
+    // A sent card can never be edited or recalled, so its chips stay live after
+    // the question closes. A quote of a card we already settled is exactly that:
+    // refuse it rather than letting it answer whatever is pending now.
+    if (!entry && closedRefs && closedRefs.has(refIdx)) return { kind: 'stale' }
   }
   if (!entry && prefixed) {
     entry = findByAlias(approvalsList, Number(prefixed[1]))
@@ -258,23 +285,32 @@ export function parseCommand(text) {
  * @param {Map<string, string>} [input.sentCards] ref_idx -> sessionId for notification cards we sent
  * @param {Map<number, string>} [input.aliasSessions] alias -> sessionId
  * @param {string} [input.refIdx]
+ * @param {Set<string>} [input.closedRefs] ref_idx values of cards already settled
  * @param {string} input.text
  * @returns {
  *   | { kind: 'command', command: string, alias?: number }
- *   | { kind: 'decision', decision: { kind: 'approval' | 'question', entry: any, payload: string } }
+ *   | { kind: 'decision', decision: { kind: 'approval' | 'question' | 'stale', entry: any, payload: string } }
  *   | { kind: 'session', sessionId: string, payload: string }
  *   | { kind: 'error', message: string }
  *   | undefined
  * }
  */
-export function selectInboundRoute({ approvals, questions, sentCards, aliasSessions, refIdx, text }) {
+export function selectInboundRoute({
+  approvals,
+  questions,
+  sentCards,
+  aliasSessions,
+  refIdx,
+  closedRefs,
+  text,
+}) {
   const value = String(text ?? '').trim()
   if (!value) return undefined
 
   const command = parseCommand(value)
   if (command) return { kind: 'command', ...command }
 
-  const decision = selectPendingDecision({ approvals, questions, refIdx, text: value })
+  const decision = selectPendingDecision({ approvals, questions, refIdx, closedRefs, text: value })
   if (decision) return { kind: 'decision', decision }
 
   if (refIdx && sentCards && sentCards.has(refIdx)) {

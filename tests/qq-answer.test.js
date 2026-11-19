@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 
 import {
   extractRefIdx,
+  isClosedLabel,
   parseApprovalOutcome,
   parseCommand,
   parseQuestionAnswer,
@@ -106,6 +107,40 @@ test('question answers: 其他 opens the free-text door', () => {
 
 const approval = (alias, refIds = []) => ({ alias, refIds })
 const question = (alias, refIds = []) => ({ alias, refIds })
+
+test('routing: a quote of a settled card is refused, not re-routed', () => {
+  const q = question(2, ['R1'])
+  const stale = selectPendingDecision({
+    approvals: [],
+    questions: [q],
+    refIdx: 'R_old',
+    closedRefs: new Set(['R_old']),
+    text: '其他：随便写',
+  })
+  assert.equal(stale.kind, 'stale')
+  // Without that record an unknown quote still falls back to the sole pending
+  // decision — that is how quoting a notification card keeps working.
+  const fallback = selectPendingDecision({
+    approvals: [],
+    questions: [q],
+    refIdx: 'R_other',
+    closedRefs: new Set(['R_old']),
+    text: '随便写',
+  })
+  assert.equal(fallback.kind, 'question')
+})
+
+test('stale labels: a settled option label is refused unless the new question offers it', () => {
+  const closed = new Set(['方案一', '方案二'])
+  const current = { id: 'q', options: [{ label: '方案三' }] }
+  assert.equal(isClosedLabel('方案一', closed, current), true)
+  assert.equal(isClosedLabel(' 方案一 ', closed, current), true)
+  // The same label on the live question is a legitimate re-answer.
+  assert.equal(isClosedLabel('方案三', new Set(['方案三']), current), false)
+  assert.equal(isClosedLabel('随便', closed, current), false)
+  assert.equal(isClosedLabel('', closed, current), false)
+  assert.equal(isClosedLabel('方案一', undefined, current), false)
+})
 
 test('routing: quoted card wins over the alias prefix', () => {
   const a = approval(1, ['R1'])

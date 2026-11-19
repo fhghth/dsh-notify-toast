@@ -23,6 +23,7 @@ import {
 import { fitMessage, pendingReplyText, summarizeUsage, turnReplyText, turnStartSeq } from './qq-reply.js'
 import {
   extractRefIdx,
+  isClosedLabel,
   parseApprovalOutcome,
   parseQuestionAnswer,
   selectInboundRoute,
@@ -830,6 +831,12 @@ export function apply(ctx, rawConfig) {
         await replyQQ(openid, message.msgId, hint)
         return
       }
+      // Nothing is pending and the text is a label we already closed: this is a
+      // tap on a leftover card, not a request for the connection guide.
+      if (looksLikeClosedAnswer(message.content)) {
+        await replyQQ(openid, message.msgId, STALE_CARD_TEXT)
+        return
+      }
       await replyQQ(
         openid,
         message.msgId,
@@ -1431,6 +1438,7 @@ export function apply(ctx, rawConfig) {
       const onAbort = () => {
         if (pendingApprovals.get(sessionId) !== entry) return
         pendingApprovals.delete(sessionId)
+        rememberClosedRefs(entry.refIds)
         resolve('cancelled')
       }
       entry.onAbort = onAbort
@@ -1477,6 +1485,7 @@ export function apply(ctx, rawConfig) {
       const onAbort = () => {
         if (pendingQuestions.get(sessionId) !== entry) return
         pendingQuestions.delete(sessionId)
+        rememberClosedRefs(entry.refIds)
         const error = new Error('ask_user_question was aborted before the user answered')
         error.code = 'ASK_ABORTED'
         reject(error)
@@ -1502,6 +1511,62 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * Labels of questions that are already settled, per session.
+   *
+   * QQ offers no way to edit or recall a sent message, so a card's chips keep
+   * working forever. Single-choice chips cannot carry a quote, which leaves the
+   * label as the only identity — remembering the closed ones is what turns a
+   * stray tap into a clear refusal instead of a wrong answer.
+   */
+  const closedLabels = new Map()
+  const CLOSED_LABEL_LIMIT = 40
+
+  /** ref_idx of cards that already settled — quoting one must not answer.
+   *
+   * A batch reuses one entry, so its refIds are reset per card: otherwise
+   * quoting the first card of a two-question batch would resolve the second.
+   */
+  const closedRefs = new Set()
+  const CLOSED_REF_LIMIT = 200
+
+  function rememberClosedRefs(refIds) {
+    for (const ref of Array.isArray(refIds) ? refIds : []) {
+      if (!ref) continue
+      closedRefs.add(ref)
+    }
+    while (closedRefs.size > CLOSED_REF_LIMIT) closedRefs.delete(closedRefs.values().next().value)
+  }
+
+  function recordClosedLabels(sessionId, questions) {
+    if (!sessionId) return
+    let set = closedLabels.get(sessionId)
+    if (!set) {
+      set = new Set()
+      closedLabels.set(sessionId, set)
+    }
+    for (const question of Array.isArray(questions) ? questions : []) {
+      for (const option of Array.isArray(question?.options) ? question.options : []) {
+        const label = String(option?.label ?? '').trim().toLowerCase()
+        if (label) set.add(label)
+      }
+    }
+    while (set.size > CLOSED_LABEL_LIMIT) set.delete(set.values().next().value)
+  }
+
+  const STALE_CARD_TEXT =
+    '这张卡片对应的问题已经结束了（答过了，或者已经超时）。\n卡片留在聊天记录里，但它的选项不会再生效。'
+
+  /** Does this text match an option label from a question that already closed? */
+  function looksLikeClosedAnswer(text) {
+    const value = String(text ?? '').trim().toLowerCase()
+    if (!value) return false
+    for (const set of closedLabels.values()) {
+      if (set.has(value)) return true
+    }
+    return false
+  }
+
   /** Resolve one parked approval/question with the reply text. */
   async function answerPending(target, payload, message) {
     const openid = message.openid
@@ -1514,6 +1579,7 @@ export function apply(ctx, rawConfig) {
         return
       }
       pendingApprovals.delete(entry.sessionId)
+      rememberClosedRefs(entry.refIds)
       if (entry.onAbort && entry.request.signal) {
         entry.request.signal.removeEventListener('abort', entry.onAbort)
       }
@@ -1534,6 +1600,10 @@ export function apply(ctx, rawConfig) {
       return
     }
     entry.collected.push(parseQuestionAnswer(question, payload))
+    // The question is answered from here on; its card must stop counting.
+    recordClosedLabels(entry.sessionId, [question])
+    rememberClosedRefs(entry.refIds)
+    entry.refIds = []
     entry.index += 1
     if (entry.index < entry.request.questions.length) {
       const next = entry.request.questions[entry.index]
@@ -1544,7 +1614,7 @@ export function apply(ctx, rawConfig) {
         questionCardText(entry.sessionId, entry.title, next, nth, total, false),
         entry.sessionId,
       )
-      if (refIds) entry.refIds.push(...refIds)
+      if (refIds) entry.refIds = refIds
       await replyQQ(openid, msgId, `✅ 第 ${entry.index} 题已记录（会话 #${entry.alias}），下一题已发送`)
       return
     }
@@ -2076,11 +2146,24 @@ export function apply(ctx, rawConfig) {
       sentCards,
       aliasSessions: aliasToSessionMap(),
       refIdx: extractRefIdx(message.raw),
+      closedRefs,
       text,
     })
     if (!route) return false
 
     if (route.kind === 'decision') {
+      if (route.decision.kind === 'stale') {
+        await replyQQ(message.openid, message.msgId, STALE_CARD_TEXT)
+        return true
+      }
+      const entry = route.decision.entry
+      if (route.decision.kind === 'question') {
+        const current = entry.request.questions[entry.index]
+        if (isClosedLabel(route.decision.payload, closedLabels.get(entry.sessionId), current)) {
+          await replyQQ(message.openid, message.msgId, STALE_CARD_TEXT)
+          return true
+        }
+      }
       await answerPending(route.decision, route.decision.payload, message)
       return true
     }
