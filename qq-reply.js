@@ -93,6 +93,56 @@ export function pendingReplyText(events, beforeSeq) {
 }
 
 /**
+ * Roll the durable log up into the numbers the DSH status bar shows.
+ *
+ * Counts come from the log itself, so they need no service. Token figures are
+ * summed from each `assistant/message`'s provider-reported `usage`:
+ *
+ *   usage = { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens }
+ *
+ * where `inputTokens` is already the *uncached* part, so the cache hit rate is
+ * `cacheRead / (cacheRead + input)`.
+ *
+ * @param {Array<any>} events
+ * @param {{ fromSeq?: number, toSeq?: number }} [range]
+ */
+export function summarizeUsage(events, { fromSeq = 0, toSeq = Number.POSITIVE_INFINITY } = {}) {
+  const summary = {
+    turns: 0,
+    steps: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    /** 0..1, or undefined when no request reported a prompt size. */
+    cacheHit: undefined,
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event) continue
+    const seq = Number(event.seq)
+    if (!Number.isFinite(seq) || seq < fromSeq || seq > toSeq) continue
+    if (event.type === 'turn/end') summary.turns += 1
+    else if (event.type === 'step/end') summary.steps += 1
+
+    const usage = event.type === 'assistant/message' ? event.data?.usage : undefined
+    if (!usage || typeof usage !== 'object') continue
+    const input = Number(usage.inputTokens) || 0
+    const output = Number(usage.outputTokens) || 0
+    const cacheRead = Number(usage.cacheReadTokens) || 0
+    const cacheWrite = Number(usage.cacheWriteTokens) || 0
+    summary.inputTokens += input
+    summary.outputTokens += output
+    summary.cacheReadTokens += cacheRead
+    summary.cacheWriteTokens += cacheWrite
+    summary.totalTokens += Number(usage.totalTokens) || input + output + cacheRead + cacheWrite
+  }
+  const prompt = summary.cacheReadTokens + summary.inputTokens
+  if (prompt > 0) summary.cacheHit = summary.cacheReadTokens / prompt
+  return summary
+}
+
+/**
  * Last-resort truncation, used only after the platform rejects a message as
  * too long. Head and tail are kept because the conclusion usually lives at the
  * end while the intent lives at the start.

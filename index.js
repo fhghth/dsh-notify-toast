@@ -20,7 +20,7 @@ import {
   PANEL_ITEM_LIMIT,
   PANEL_REMARK,
 } from './qq-panel.js'
-import { fitMessage, pendingReplyText, turnReplyText } from './qq-reply.js'
+import { fitMessage, pendingReplyText, summarizeUsage, turnReplyText, turnStartSeq } from './qq-reply.js'
 import {
   extractRefIdx,
   parseApprovalOutcome,
@@ -862,10 +862,9 @@ export function apply(ctx, rawConfig) {
   }
 
   /** The assistant's own words for the turn that just ended, when enabled. */
-  function replyBodyForTurn(session, endSeq) {
-    if (!cfg().qqNotifyReply) return ''
+  function turnTextSafe(events, endSeq) {
     try {
-      return turnReplyText(safeEvents(session), endSeq)
+      return turnReplyText(events, endSeq)
     } catch (error) {
       log('qq reply extraction failed', error)
       return ''
@@ -883,8 +882,65 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /** `1234` -> `1.2K`, `151234567` -> `151M`. */
+  function formatTokens(value) {
+    const n = Number(value) || 0
+    const scaled = (unit, size) => {
+      const v = n / size
+      return `${v >= 10 ? Math.round(v) : Math.round(v * 10) / 10}${unit}`
+    }
+    if (n >= 1e9) return scaled('B', 1e9)
+    if (n >= 1e6) return scaled('M', 1e6)
+    if (n >= 1e3) return scaled('K', 1e3)
+    return String(n)
+  }
+
+  /** `2026.11.19.22:47` — the shape asked for in the card. */
+  function formatStamp(ms) {
+    const date = new Date(ms)
+    const pad = (value) => String(value).padStart(2, '0')
+    return `${date.getFullYear()}.${pad(date.getMonth() + 1)}.${pad(date.getDate())}.${pad(date.getHours())}:${pad(date.getMinutes())}`
+  }
+
+  /**
+   * Context occupancy, straight from the service the status bar uses.
+   * Returns undefined when either half of the fact is missing.
+   */
+  function contextUsageOf(session) {
+    try {
+      const meter = ctx.get('tokenMeter')
+      if (!meter || typeof meter.measure !== 'function') return undefined
+      const size = Number(session?.requestContext?.()?.contextWindow) || 0
+      if (!(size > 0)) return undefined
+      const used = Number(meter.measure(session)?.totalTokens) || 0
+      if (!(used > 0)) return undefined
+      return { used, size, ratio: used / size }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * One line of run statistics.
+   *
+   * `turnTokens / turnSeconds` is deliberately labelled "本轮 … tok/s" because
+   * it includes thinking and tool time — it is not the pure decode speed the
+   * DSH status bar reports, and pretending otherwise would invite confusion.
+   */
+  function statsLine(total, context, turnSummary, turnSeconds) {
+    const parts = []
+    if (total.turns > 0 || total.steps > 0) parts.push(`${total.turns} 轮 ${total.steps} 步`)
+    if (total.totalTokens > 0) parts.push(`${formatTokens(total.totalTokens)} tok`)
+    if (total.cacheHit !== undefined) parts.push(`缓存 ${Math.round(total.cacheHit * 100)}%`)
+    if (context) parts.push(`上下文 ${Math.round(context.ratio * 100)}%`)
+    if (turnSummary.outputTokens > 0 && turnSeconds > 0) {
+      parts.push(`本轮 ${Math.round(turnSummary.outputTokens / turnSeconds)} tok/s`)
+    }
+    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : ''
+  }
+
   /** Send one programmatic card to every target. */
-  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, detail, body }) {
+  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, finishedAt, stats, detail, body }) {
     if (!qq || qqStatus.state !== 'ready') return
     const targets = qqTargets()
     if (targets.length === 0) {
@@ -892,7 +948,9 @@ export function apply(ctx, rawConfig) {
       return
     }
     const lines = [cardHeader(emoji, sessionId, title, suffix)]
+    if (stats) lines.push(stats)
     if (elapsed) lines.push(`用时：${elapsed}`)
+    if (finishedAt) lines.push(`结束：${finishedAt}`)
     if (cwd) lines.push(`目录：${cwd}`)
     if (detail) lines.push(detail)
     const markdown = withBody(lines.join('\n'), body)
@@ -1884,15 +1942,23 @@ export function apply(ctx, rawConfig) {
             : reason === 'interrupted'
               ? { emoji: '⏹', suffix: '已中断' }
               : { emoji: '⚠️', suffix: '任务失败' }
+        const events = safeEvents(session)
+        const turnSeconds = startedAt ? Math.max(0, (now - startedAt) / 1000) : 0
+        const turnSummary = summarizeUsage(events, {
+          fromSeq: startedAt ? turnStartSeq(events, event.seq) : 0,
+          toSeq: event.seq,
+        })
         void notifyQQ({
           sessionId,
           emoji: badge.emoji,
           suffix: badge.suffix,
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
+          stats: statsLine(summarizeUsage(events), contextUsageOf(session), turnSummary, turnSeconds),
           elapsed: elapsedText,
+          finishedAt: formatStamp(now),
           detail: error ? `错误：${error.code} ${error.message}` : '',
-          body: replyBodyForTurn(session, event.seq),
+          body: cfg().qqNotifyReply ? turnTextSafe(events, event.seq) : '',
         })
       }
     }, Math.max(0, Number(current.settleMs) || 0))

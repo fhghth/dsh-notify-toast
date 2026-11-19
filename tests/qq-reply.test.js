@@ -10,6 +10,7 @@ import {
   collectAssistantText,
   fitMessage,
   pendingReplyText,
+  summarizeUsage,
   turnReplyText,
   turnStartSeq,
 } from '../qq-reply.js'
@@ -88,6 +89,63 @@ test('pendingReplyText: everything since the current turn started', () => {
   assert.equal(pendingReplyText(session, 5), '第一段\n\n第二段')
   // An approval asked before the model said anything yields an empty body.
   assert.equal(pendingReplyText([{ type: 'turn/start', seq: 1 }, { type: 'approval/asked', seq: 2 }], 2), '')
+})
+
+// ── usage roll-up ──────────────────────────────────────────────────────────
+
+function withUsage(seq, usage) {
+  return { type: 'assistant/message', seq, data: { usage, message: { content: [] } } }
+}
+
+test('summarizeUsage: counts turns and steps from the log', () => {
+  const summary = summarizeUsage(session)
+  assert.equal(summary.turns, 1)
+  assert.equal(summary.steps, 0)
+  const dense = [
+    { type: 'turn/end', seq: 1 },
+    { type: 'step/end', seq: 2 },
+    { type: 'step/end', seq: 3 },
+    { type: 'turn/end', seq: 4 },
+  ]
+  const s = summarizeUsage(dense)
+  assert.equal(s.turns, 2)
+  assert.equal(s.steps, 2)
+})
+
+test('summarizeUsage: sums provider usage and derives the cache hit rate', () => {
+  const events = [
+    withUsage(1, { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 9000, cacheWriteTokens: 0, totalTokens: 10200 }),
+    withUsage(2, { inputTokens: 0, outputTokens: 100, cacheReadTokens: 10000, cacheWriteTokens: 0, totalTokens: 10100 }),
+  ]
+  const s = summarizeUsage(events)
+  assert.equal(s.inputTokens, 1000)
+  assert.equal(s.outputTokens, 300)
+  assert.equal(s.cacheReadTokens, 19000)
+  assert.equal(s.totalTokens, 20300)
+  assert.ok(Math.abs(s.cacheHit - 19000 / 20000) < 1e-9)
+})
+
+test('summarizeUsage: no usage facts means no cache rate', () => {
+  const s = summarizeUsage([{ type: 'turn/end', seq: 1 }])
+  assert.equal(s.cacheHit, undefined)
+  assert.equal(s.totalTokens, 0)
+})
+
+test('summarizeUsage: honours the sequence range', () => {
+  const events = [
+    withUsage(1, { inputTokens: 10, outputTokens: 1, totalTokens: 11 }),
+    withUsage(2, { inputTokens: 20, outputTokens: 2, totalTokens: 22 }),
+    { type: 'turn/end', seq: 3 },
+  ]
+  const only = summarizeUsage(events, { fromSeq: 2, toSeq: 3 })
+  assert.equal(only.inputTokens, 20)
+  assert.equal(only.turns, 1)
+  assert.equal(only.steps, 0)
+})
+
+test('summarizeUsage: tolerates garbage', () => {
+  assert.equal(summarizeUsage(undefined).turns, 0)
+  assert.equal(summarizeUsage([null, {}, { type: 'assistant/message', seq: 1, data: {} }]).totalTokens, 0)
 })
 
 // ── last-resort truncation ─────────────────────────────────────────────────
