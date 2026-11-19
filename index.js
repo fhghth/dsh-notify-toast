@@ -566,10 +566,32 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * Labels of questions that are already settled, per session.
+   *
+   * QQ offers no way to edit or recall a sent message, so a card's chips keep
+   * working forever. Single-choice chips cannot carry a quote, which leaves the
+   * label as the only identity — remembering the closed ones is what turns a
+   * stray tap into a clear refusal instead of a wrong answer. Persisted, because
+   * a reload would otherwise forget every card still sitting in the chat.
+   */
+  const closedLabels = new Map()
+  const CLOSED_LABEL_LIMIT = 40
+
+  /** ref_idx of cards that already settled — quoting one must not answer.
+   *
+   * A batch reuses one entry, so its refIds are reset per card: otherwise
+   * quoting the first card of a two-question batch would resolve the second.
+   */
+  const closedRefs = new Set()
+  const CLOSED_REF_LIMIT = 200
+
   function loadQQState() {
     qqSubscriptions.clear()
     qqLearned = []
     qqPanelId = ''
+    closedLabels.clear()
+    closedRefs.clear()
     try {
       if (!existsSync(QQ_STATE_FILE)) return
       const migrated = migrateQQState(JSON.parse(readFileSync(QQ_STATE_FILE, 'utf8')))
@@ -578,6 +600,16 @@ export function apply(ctx, rawConfig) {
       }
       qqLearned = migrated.learnedOpenids
       qqPanelId = migrated.panelId
+      for (const [sessionId, labels] of Object.entries(migrated.closed.labels)) {
+        if (!sessionId || !Array.isArray(labels)) continue
+        const set = new Set(labels.filter((label) => typeof label === 'string' && label))
+        while (set.size > CLOSED_LABEL_LIMIT) set.delete(set.values().next().value)
+        if (set.size > 0) closedLabels.set(sessionId, set)
+      }
+      for (const ref of migrated.closed.refs) {
+        if (typeof ref === 'string' && ref) closedRefs.add(ref)
+      }
+      while (closedRefs.size > CLOSED_REF_LIMIT) closedRefs.delete(closedRefs.values().next().value)
     } catch (error) {
       log('qq state load failed', error)
     }
@@ -592,6 +624,7 @@ export function apply(ctx, rawConfig) {
         subscriptions: Object.fromEntries(qqSubscriptions),
         learnedOpenids: qqLearned,
         panelId: qqPanelId,
+        closed: closedStateForFile(),
       }
       const temporary = `${QQ_STATE_FILE}.${process.pid}.tmp`
       writeFileSync(temporary, JSON.stringify(payload, null, 2), 'utf8')
@@ -844,6 +877,7 @@ export function apply(ctx, rawConfig) {
           '**通知机器人已连接**',
           '在 DSH 会话标题栏点 **QQ** 图标，即可让该会话把通知转发到这里。',
           '支持：`#别名 内容` 投递、`/s 别名` 查看状态、`/ls` 列出会话。',
+          '点了聊天记录里的旧卡片不会生效——那道题已经结束了。',
         ].join('\n'),
       )
     })
@@ -1356,9 +1390,12 @@ export function apply(ctx, rawConfig) {
   }
 
   function questionCardText(sessionId, title, question, index, total, chips = true) {
+    // The kind is part of the heading, not a `问题：` prefix: on a phone the
+    // first thing the user needs is whether one tap answers it or adds to it.
+    const kind = question.multiSelect ? '**多选：**' : '**单选：**'
     const lines = [
       cardHeader('❓', sessionId, title, `需要你回答（${index}/${total}）`),
-      `问题：${question.question}`,
+      `${kind}${question.question}`,
     ]
     const options = Array.isArray(question.options) ? question.options : []
     if (options.length > 0) {
@@ -1511,31 +1548,15 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /**
-   * Labels of questions that are already settled, per session.
-   *
-   * QQ offers no way to edit or recall a sent message, so a card's chips keep
-   * working forever. Single-choice chips cannot carry a quote, which leaves the
-   * label as the only identity — remembering the closed ones is what turns a
-   * stray tap into a clear refusal instead of a wrong answer.
-   */
-  const closedLabels = new Map()
-  const CLOSED_LABEL_LIMIT = 40
-
-  /** ref_idx of cards that already settled — quoting one must not answer.
-   *
-   * A batch reuses one entry, so its refIds are reset per card: otherwise
-   * quoting the first card of a two-question batch would resolve the second.
-   */
-  const closedRefs = new Set()
-  const CLOSED_REF_LIMIT = 200
-
   function rememberClosedRefs(refIds) {
+    let changed = false
     for (const ref of Array.isArray(refIds) ? refIds : []) {
-      if (!ref) continue
+      if (!ref || closedRefs.has(ref)) continue
       closedRefs.add(ref)
+      changed = true
     }
     while (closedRefs.size > CLOSED_REF_LIMIT) closedRefs.delete(closedRefs.values().next().value)
+    if (changed) persistQQStateSoon()
   }
 
   function recordClosedLabels(sessionId, questions) {
@@ -1545,13 +1566,27 @@ export function apply(ctx, rawConfig) {
       set = new Set()
       closedLabels.set(sessionId, set)
     }
+    let changed = false
     for (const question of Array.isArray(questions) ? questions : []) {
       for (const option of Array.isArray(question?.options) ? question.options : []) {
         const label = String(option?.label ?? '').trim().toLowerCase()
-        if (label) set.add(label)
+        if (label && !set.has(label)) {
+          set.add(label)
+          changed = true
+        }
       }
     }
     while (set.size > CLOSED_LABEL_LIMIT) set.delete(set.values().next().value)
+    if (changed) persistQQStateSoon()
+  }
+
+  /** Snapshot of the closed markers, in the state-file shape. */
+  function closedStateForFile() {
+    const labels = {}
+    for (const [sessionId, set] of closedLabels) {
+      if (set.size > 0) labels[sessionId] = [...set]
+    }
+    return { labels, refs: [...closedRefs] }
   }
 
   const STALE_CARD_TEXT =

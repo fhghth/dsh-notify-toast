@@ -100,6 +100,21 @@ test('migrateQQState: tolerates garbage and old shapes', () => {
   )
   const legacy = migrateQQState({ subscriptions: { a: 1 } })
   assert.equal(legacy.subscriptions.a.alias, 1)
+  assert.deepEqual(legacy.closed, { labels: {}, refs: [] })
+})
+
+test('migrateQQState: the closed-card record survives a round trip', () => {
+  const migrated = migrateQQState({
+    subscriptions: { a: { alias: 1 } },
+    closed: {
+      labels: { a: ['方案一', '方案二'], b: 'nope', c: [42, '方案三'] },
+      refs: ['REF1', '', 7, 'REF2'],
+    },
+  })
+  // A card cannot be recalled, so forgetting what closed would let a stale
+  // chip tap answer the wrong question after a reload.
+  assert.deepEqual(migrated.closed.labels, { a: ['方案一', '方案二'], c: ['方案三'] })
+  assert.deepEqual(migrated.closed.refs, ['REF1', 'REF2'])
 })
 
 test('selectStaleSubscriptions: only cold subscriptions past the TTL are retired', () => {

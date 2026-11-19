@@ -193,7 +193,7 @@ export function allocateAlias(taken) {
  * dropped here — that is what retires the stale numbers after an upgrade.
  *
  * @param {any} raw parsed `state.json`
- * @returns {{ version: number, subscriptions: Record<string, { alias: number, since: number, title: string }>, learnedOpenids: string[], panelId: string }}
+ * @returns {{ version: number, subscriptions: Record<string, { alias: number, since: number, title: string }>, learnedOpenids: string[], panelId: string, closed: { labels: Record<string, string[]>, refs: string[] } }}
  */
 export function migrateQQState(raw) {
   const data = raw && typeof raw === 'object' ? raw : {}
@@ -236,6 +236,20 @@ export function migrateQQState(raw) {
     }
   }
 
+  // Cards cannot be recalled, so the record of what already closed has to
+  // outlive a reload: it is the only thing that refuses a stale chip tap.
+  const rawClosed = data.closed && typeof data.closed === 'object' ? data.closed : {}
+  const rawLabels = rawClosed.labels && typeof rawClosed.labels === 'object' ? rawClosed.labels : {}
+  const labels = {}
+  for (const [sessionId, values] of Object.entries(rawLabels)) {
+    if (!sessionId || !Array.isArray(values)) continue
+    const kept = values.filter((value) => typeof value === 'string' && value)
+    if (kept.length > 0) labels[sessionId] = kept
+  }
+  const refs = Array.isArray(rawClosed.refs)
+    ? rawClosed.refs.filter((value) => typeof value === 'string' && value)
+    : []
+
   return {
     version: 3,
     subscriptions,
@@ -243,6 +257,7 @@ export function migrateQQState(raw) {
       ? data.learnedOpenids.filter((value) => typeof value === 'string' && value)
       : [],
     panelId: typeof data.panelId === 'string' ? data.panelId : '',
+    closed: { labels, refs },
   }
 }
 
