@@ -923,9 +923,9 @@ export function apply(ctx, rawConfig) {
   /**
    * One line of run statistics.
    *
-   * `turnTokens / turnSeconds` is deliberately labelled "本轮 … tok/s" because
-   * it includes thinking and tool time — it is not the pure decode speed the
-   * DSH status bar reports, and pretending otherwise would invite confusion.
+   * The turn figure is stated as `N tok / M 秒` rather than a tok/s number: it
+   * includes thinking and tool time, so a rate would sit next to the status
+   * bar's pure decode speed and look wrong by a wide margin.
    */
   function statsLine(total, context, turnSummary, turnSeconds) {
     const parts = []
@@ -934,7 +934,7 @@ export function apply(ctx, rawConfig) {
     if (total.cacheHit !== undefined) parts.push(`缓存 ${Math.round(total.cacheHit * 100)}%`)
     if (context) parts.push(`上下文 ${Math.round(context.ratio * 100)}%`)
     if (turnSummary.outputTokens > 0 && turnSeconds > 0) {
-      parts.push(`本轮 ${Math.round(turnSummary.outputTokens / turnSeconds)} tok/s`)
+      parts.push(`本轮 ${formatTokens(turnSummary.outputTokens)} tok / ${fmtDuration(turnSeconds)}`)
     }
     return parts.length > 0 ? `📊 ${parts.join(' · ')}` : ''
   }
@@ -1948,6 +1948,9 @@ export function apply(ctx, rawConfig) {
           fromSeq: startedAt ? turnStartSeq(events, event.seq) : 0,
           toSeq: event.seq,
         })
+        // The stats line already carries this turn's duration; repeating it on
+        // its own 用时 line would print the same number twice.
+        const statsHasDuration = turnSummary.outputTokens > 0 && turnSeconds > 0
         void notifyQQ({
           sessionId,
           emoji: badge.emoji,
@@ -1955,7 +1958,7 @@ export function apply(ctx, rawConfig) {
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
           stats: statsLine(summarizeUsage(events), contextUsageOf(session), turnSummary, turnSeconds),
-          elapsed: elapsedText,
+          elapsed: statsHasDuration ? '' : elapsedText,
           finishedAt: formatStamp(now),
           detail: error ? `错误：${error.code} ${error.message}` : '',
           body: cfg().qqNotifyReply ? turnTextSafe(events, event.seq) : '',
