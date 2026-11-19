@@ -848,15 +848,15 @@ export function apply(ctx, rawConfig) {
   /**
    * Append the assistant's reply between two rules, with a caption line.
    *
-   * QQ's markdown has no alignment primitive (no HTML, no `align`), so the
-   * caption is "centred" the only way that renders everywhere: symmetric
-   * decoration on both sides. The blank lines between the `---` marks are
-   * required — adjacent rules would be parsed as a setext heading underline.
+   * Plain bold rather than anything fancier: QQ's markdown has no alignment
+   * primitive, so decoration was only ever faking centring. The blank lines
+   * between the `---` marks are required — adjacent rules would be parsed as
+   * a setext heading underline.
    */
   function withBody(markdown, body, label = '本轮输出') {
     const text = typeof body === 'string' ? body.trim() : ''
     if (!text) return markdown
-    const caption = label ? `── 📄 ${label} ──\n\n` : ''
+    const caption = label ? `**📄 ${label}**\n\n` : ''
     return `${markdown}\n\n---\n\n${caption}---\n\n${text}`
   }
 
