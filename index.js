@@ -1289,7 +1289,9 @@ export function apply(ctx, rawConfig) {
     if (options.length > 0) {
       lines.push('')
       options.forEach((option, i) => {
-        lines.push(`${i + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
+        // `：` keeps the line shorter than ` — `, which matters because a long
+      // description wraps mid-line on a phone.
+      lines.push(`${i + 1}. ${option.label}${option.description ? `：${option.description}` : ''}`)
       })
       lines.push('', question.multiSelect ? '回复编号选择（多选用逗号），或直接输入文字' : '回复编号选择，或直接输入文字')
     } else {
