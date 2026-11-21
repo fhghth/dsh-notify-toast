@@ -132,6 +132,7 @@ window.__ModuleLoader__.load({
           { key: 'qqAnswerQuestions', label: '在 QQ 上回答提问', type: 'bool', hint: '开启后：本会话的 Agent 提问同样转到 QQ' },
           { key: 'qqPanelEnabled', label: '同步会话到 QQ 指令面板', type: 'bool', hint: '在 QQ 聊天里生成一块「会话看板」，点任意一项即可切到那个会话；不占用消息条数' },
           { key: 'qqNotifyReply', label: '把会话输出一起推到 QQ', type: 'bool', hint: '会话结束时，把 Agent 本轮写出的正文附在通知卡片后面；审批/提问卡会附上它到目前为止的说明' },
+          { key: 'qqNotifyFiles', label: '通知卡片里列出本轮改动的文件', type: 'bool', hint: '由 DSH 的改动记录提供：git 快照与文件工具编辑的并集。纯 shell 改动的文件不在其中；插件重载后旧轮次的文件列表会取不到' },
           { key: 'qqSubscriptionTtlDays', label: '冷会话订阅保留天数', type: 'number', hint: '会话连续这么多天没打开就自动取消 QQ 通知；0 表示永不清理' },
         ],
       },
