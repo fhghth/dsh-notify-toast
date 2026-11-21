@@ -21,7 +21,7 @@ import {
   PANEL_REMARK,
 } from './qq-panel.js'
 import { fitMessage, pendingReplyText, summarizeUsage, turnReplyText, turnStartSeq } from './qq-reply.js'
-import { cell, changesSeqOfTurn, fileRows, markdownTable } from './qq-changes.js'
+import { changesSeqOfTurn, fileTable, markdownTable } from './qq-changes.js'
 import {
   extractRefIdx,
   isClosedLabel,
@@ -990,72 +990,69 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Run statistics as table rows.
+   * One line of run statistics.
    *
    * The turn figure is stated as `N tok / M 秒` rather than a tok/s number: it
    * includes thinking and tool time, so a rate would sit next to the status
    * bar's pure decode speed and look wrong by a wide margin.
-   *
-   * @returns {Array<[string, string]>}
    */
-  function statsRows(total, context, turnSummary, turnSeconds) {
-    const rows = []
-    if (total.turns > 0 || total.steps > 0) rows.push(['轮次', `${total.turns} 轮 ${total.steps} 步`])
-    const usage = []
-    if (total.totalTokens > 0) usage.push(`${formatTokens(total.totalTokens)} tok`)
-    if (total.cacheHit !== undefined) usage.push(`缓存 ${Math.round(total.cacheHit * 100)}%`)
-    if (context) usage.push(`上下文 ${Math.round(context.ratio * 100)}%`)
-    if (usage.length > 0) rows.push(['用量', usage.join(' · ')])
+  function statsLine(total, context, turnSummary, turnSeconds) {
+    const parts = []
+    if (total.turns > 0 || total.steps > 0) parts.push(`${total.turns} 轮 ${total.steps} 步`)
+    if (total.totalTokens > 0) parts.push(`${formatTokens(total.totalTokens)} tok`)
+    if (total.cacheHit !== undefined) parts.push(`缓存 ${Math.round(total.cacheHit * 100)}%`)
+    if (context) parts.push(`上下文 ${Math.round(context.ratio * 100)}%`)
     if (turnSummary.outputTokens > 0 && turnSeconds > 0) {
-      rows.push(['本轮', `${formatTokens(turnSummary.outputTokens)} tok / ${fmtDuration(turnSeconds)}`])
+      parts.push(`本轮 ${formatTokens(turnSummary.outputTokens)} tok / ${fmtDuration(turnSeconds)}`)
     }
-    return rows
+    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : ''
   }
 
   /**
-   * The files this turn touched, straight from DSH's recorder.
+   * The change summary this turn announced, straight from DSH's recorder.
    *
    * `workspaceChanges` answers by the sequence number of the `workspace/changes`
    * event, so the log is the only place that knows the coordinate. The summaries
    * live in the Host process only — after a reload the rows disappear rather
    * than being guessed from tool calls.
    */
-  function filesForTurn(events, sessionId, fromSeq) {
+  function changesForTurn(events, sessionId, fromSeq) {
     try {
       const seq = changesSeqOfTurn(events, fromSeq)
-      if (seq === undefined) return []
+      if (seq === undefined) return undefined
       const changes = ctx.get('workspaceChanges')
-      if (!changes || typeof changes.summary !== 'function') return []
-      return fileRows(changes.summary(sessionId, seq))
+      if (!changes || typeof changes.summary !== 'function') return undefined
+      return changes.summary(sessionId, seq)
     } catch (error) {
       log('qq file changes lookup failed', error)
-      return []
+      return undefined
     }
   }
 
   /**
    * Send one programmatic card to every target.
    *
-   * Facts go into a single `项目 / 值` table. One lone fact stays a `键：值`
-   * line: a header, a separator and one row is more chrome than content.
+   * Facts stay plain lines — six one-off rows behind a table header is more
+   * chrome than content. The changed files get a table of their own, where the
+   * rows really are the same shape as each other.
    */
-  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, finishedAt, rows, detail, body }) {
+  async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, finishedAt, stats, files, detail, body }) {
     if (!qq || qqStatus.state !== 'ready') return
     const targets = qqTargets()
     if (targets.length === 0) {
       log('qq notify skipped: no target openid')
       return
     }
-    const facts = (Array.isArray(rows) ? rows : []).filter(
-      (row) => Array.isArray(row) && row.length === 2,
-    )
-    if (elapsed) facts.push(['用时', elapsed])
-    if (finishedAt) facts.push(['结束', finishedAt])
-    if (cwd) facts.push(['目录', cwd])
     const lines = [cardHeader(emoji, sessionId, title, suffix)]
-    if (facts.length >= 2) lines.push('', markdownTable(['项目', '值'], facts))
-    else for (const [label, value] of facts) lines.push(`${label}：${cell(value)}`)
-    if (detail) lines.push('', detail)
+    if (stats) lines.push(stats)
+    if (elapsed) lines.push(`用时：${elapsed}`)
+    if (finishedAt) lines.push(`结束：${finishedAt}`)
+    if (cwd) lines.push(`目录：${cwd}`)
+    if (files && files.rows.length > 0) {
+      const table = markdownTable(['文件', '增', '删'], files.rows)
+      if (table) lines.push('', `📝 ${files.label}`, '', table)
+    }
+    if (detail) lines.push(detail)
     const markdown = withBody(lines.join('\n'), body)
     for (const openid of targets) {
       try {
@@ -2472,20 +2469,21 @@ export function apply(ctx, rawConfig) {
         const turnSeconds = startedAt ? Math.max(0, (now - startedAt) / 1000) : 0
         const turnStart = startedAt ? turnStartSeq(events, event.seq) : 0
         const turnSummary = summarizeUsage(events, { fromSeq: turnStart, toSeq: event.seq })
-        // The stats row already carries this turn's duration; repeating it on
-        // its own 用时 row would print the same number twice.
+        // The stats line already carries this turn's duration; repeating it on
+        // its own 用时 line would print the same number twice.
         const statsHasDuration = turnSummary.outputTokens > 0 && turnSeconds > 0
-        const rows = statsRows(summarizeUsage(events), contextUsageOf(session), turnSummary, turnSeconds)
-        // Files come last: the facts above describe the run, these describe its
-        // output, and the total count is what a phone screen shows first.
-        if (current.qqNotifyFiles) rows.push(...filesForTurn(events, sessionId, turnStart))
+        const stats = statsLine(summarizeUsage(events), contextUsageOf(session), turnSummary, turnSeconds)
+        const files = current.qqNotifyFiles
+          ? fileTable(changesForTurn(events, sessionId, turnStart))
+          : undefined
         void notifyQQ({
           sessionId,
           emoji: badge.emoji,
           suffix: badge.suffix,
           title: titleOf(session),
           cwd: session.header && session.header.cwd ? session.header.cwd : '',
-          rows,
+          stats,
+          files,
           elapsed: statsHasDuration ? '' : elapsedText,
           finishedAt: formatStamp(now),
           detail: error ? `错误：${error.code} ${error.message}` : '',

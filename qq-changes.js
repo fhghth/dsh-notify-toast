@@ -76,19 +76,23 @@ export function changesSeqOfTurn(events, fromSeq = 0) {
 }
 
 /**
- * `[label, value]` rows describing what the turn changed.
+ * The file block for the completion card: a header line plus table rows.
  *
- * `display` is the Host's own presentation path — relative inside the working
- * directory, `../` above it, `~` under the home directory — so the card needs
- * no path shortening of its own.
+ * A table earns its borders here because these rows are homogeneous — one path
+ * against two counts — and the numbers line up. The key/value facts above stay
+ * plain lines: a grid for six one-off rows is noise, not structure.
+ *
+ * `display` is the Host's own presentation path, kept verbatim: relative inside
+ * the working directory, absolute outside it. The difference is the point — an
+ * absolute path is how the reader sees that the file lives elsewhere.
  *
  * @param {{ files?: Array<any>, total?: number, added?: number, deleted?: number }} summary
  * @param {{ limit?: number }} [options]
- * @returns {Array<[string, string]>}
+ * @returns {{ label: string, rows: Array<string[]> } | undefined}
  */
-export function fileRows(summary, options = {}) {
+export function fileTable(summary, options = {}) {
   const files = Array.isArray(summary?.files) ? summary.files : []
-  if (files.length === 0) return []
+  if (files.length === 0) return undefined
 
   const limit =
     Number.isInteger(options.limit) && options.limit > 0 ? options.limit : FILE_ROW_LIMIT
@@ -96,22 +100,17 @@ export function fileRows(summary, options = {}) {
   const added = Number(summary?.added) || 0
   const deleted = Number(summary?.deleted) || 0
 
-  const rows = [['文件', `${total} 个 +${added} −${deleted}`]]
   const shown = files.slice(0, limit)
+  const rows = []
   for (const file of shown) {
     const name = String(file?.display || file?.path || '').trim()
     if (!name) continue
-    rows.push([name, fileValue(file)])
+    if (file?.binary) rows.push([name, '二进制', '—'])
+    else if (file?.oversized) rows.push([name, '超限', '—'])
+    else rows.push([name, String(Number(file?.added) || 0), String(Number(file?.deleted) || 0)])
   }
   const hidden = total - shown.length
-  if (hidden > 0) rows.push([`…还有 ${hidden} 个`, '—'])
-  return rows
-}
-
-function fileValue(file) {
-  if (file?.binary) return '二进制'
-  if (file?.oversized) return '超限'
-  const added = Number(file?.added) || 0
-  const deleted = Number(file?.deleted) || 0
-  return `+${added} −${deleted}`
+  if (hidden > 0) rows.push([`…还有 ${hidden} 个`, '—', '—'])
+  if (rows.length === 0) return undefined
+  return { label: `${total} 个文件 +${added} −${deleted}`, rows }
 }
