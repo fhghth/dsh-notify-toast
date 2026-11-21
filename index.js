@@ -964,11 +964,16 @@ export function apply(ctx, rawConfig) {
     return String(n)
   }
 
-  /** `2026.11.19.22:47` — the shape asked for in the card. */
+  /**
+   * `2026/11/21/16:45` — dots read like a version number, slashes like a date.
+   *
+   * No space before the clock: the colon already separates `16:45`, and the
+   * whole stamp stays one token that can sit after `结束：` without wrapping.
+   */
   function formatStamp(ms) {
     const date = new Date(ms)
     const pad = (value) => String(value).padStart(2, '0')
-    return `${date.getFullYear()}.${pad(date.getMonth() + 1)}.${pad(date.getDate())}.${pad(date.getHours())}:${pad(date.getMinutes())}`
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())}/${pad(date.getHours())}:${pad(date.getMinutes())}`
   }
 
   /**
@@ -1032,9 +1037,10 @@ export function apply(ctx, rawConfig) {
   /**
    * Send one programmatic card to every target.
    *
-   * Facts stay plain lines — six one-off rows behind a table header is more
-   * chrome than content. The changed files get a table of their own, where the
-   * rows really are the same shape as each other.
+   * Order is what → when → where → what changed → how much. Facts stay plain
+   * lines: six one-off rows behind a table header is more chrome than content.
+   * The changed files get a table of their own, where the rows really are the
+   * same shape as each other, and the run statistics close the card.
    */
   async function notifyQQ({ sessionId, emoji, suffix, title, cwd, elapsed, finishedAt, stats, files, detail, body }) {
     if (!qq || qqStatus.state !== 'ready') return
@@ -1044,14 +1050,23 @@ export function apply(ctx, rawConfig) {
       return
     }
     const lines = [cardHeader(emoji, sessionId, title, suffix)]
-    if (stats) lines.push(stats)
-    if (elapsed) lines.push(`用时：${elapsed}`)
     if (finishedAt) lines.push(`结束：${finishedAt}`)
     if (cwd) lines.push(`目录：${cwd}`)
+    let tableAdded = false
     if (files && files.rows.length > 0) {
       const table = markdownTable(['文件', '增', '删'], files.rows)
-      if (table) lines.push('', `📝 ${files.label}`, '', table)
+      if (table) {
+        lines.push('', `📝 ${files.label}`, '', table)
+        tableAdded = true
+      }
     }
+    // A line butted straight against a table row can be read as another row, so
+    // the text that follows the table always gets a blank line of its own.
+    if (stats) {
+      if (tableAdded) lines.push('')
+      lines.push(stats)
+    }
+    if (elapsed) lines.push(`用时：${elapsed}`)
     if (detail) lines.push(detail)
     const markdown = withBody(lines.join('\n'), body)
     for (const openid of targets) {

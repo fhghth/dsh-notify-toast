@@ -54,8 +54,8 @@ test('fileTable: a header line plus one row per file', () => {
   assert.deepEqual(fileTable(summary), {
     label: '2 个文件 +128 −12',
     rows: [
-      ['index.js', '96', '8'],
-      ['tests/a.test.js', '32', '4'],
+      ['**index.js**', '96', '8'],
+      ['tests/**a.test.js**', '32', '4'],
     ],
   })
 })
@@ -69,7 +69,7 @@ test('fileTable: paths are the Host display form, absolute ones included', () =>
     deleted: 0,
     files: [{ display: 'D:/other/repo/index.js', added: 1, deleted: 0 }],
   })
-  assert.deepEqual(table.rows, [['D:/other/repo/index.js', '1', '0']])
+  assert.deepEqual(table.rows, [['D:/other/repo/**index.js**', '1', '0']])
 })
 
 test('fileTable: binary and oversized files carry no counts', () => {
@@ -84,9 +84,9 @@ test('fileTable: binary and oversized files carry no counts', () => {
     ],
   })
   assert.deepEqual(table.rows, [
-    ['logo.png', '二进制', '—'],
-    ['huge.json', '超限', '—'],
-    ['ok.js', '1', '1'],
+    ['**logo.png**', '二进制', '—'],
+    ['**huge.json**', '超限', '—'],
+    ['**ok.js**', '1', '1'],
   ])
 })
 
@@ -113,7 +113,7 @@ test('fileTable: a summary larger than the listed files still reports the total'
   assert.deepEqual(table, {
     label: '600 个文件 +5 −5',
     rows: [
-      ['a.js', '5', '5'],
+      ['**a.js**', '5', '5'],
       ['…还有 599 个', '—', '—'],
     ],
   })

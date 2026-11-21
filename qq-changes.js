@@ -105,12 +105,27 @@ export function fileTable(summary, options = {}) {
   for (const file of shown) {
     const name = String(file?.display || file?.path || '').trim()
     if (!name) continue
-    if (file?.binary) rows.push([name, '二进制', '—'])
-    else if (file?.oversized) rows.push([name, '超限', '—'])
-    else rows.push([name, String(Number(file?.added) || 0), String(Number(file?.deleted) || 0)])
+    if (file?.binary) rows.push([emphasize(name), '二进制', '—'])
+    else if (file?.oversized) rows.push([emphasize(name), '超限', '—'])
+    else rows.push([emphasize(name), String(Number(file?.added) || 0), String(Number(file?.deleted) || 0)])
   }
   const hidden = total - shown.length
   if (hidden > 0) rows.push([`…还有 ${hidden} 个`, '—', '—'])
   if (rows.length === 0) return undefined
   return { label: `${total} 个文件 +${added} −${deleted}`, rows }
+}
+
+/**
+ * Bold the file name and leave the directory plain.
+ *
+ * The directory is context; the file is what the reader is scanning for. Bold
+ * survives inside a table cell because the closing `**` is followed by the
+ * cell separator, which counts as whitespace.
+ *
+ * @param {string} path
+ */
+function emphasize(path) {
+  const slash = path.lastIndexOf('/')
+  if (slash < 0 || slash === path.length - 1) return `**${path}**`
+  return `${path.slice(0, slash + 1)}**${path.slice(slash + 1)}**`
 }
