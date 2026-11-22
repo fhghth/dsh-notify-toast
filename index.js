@@ -893,6 +893,10 @@ export function apply(ctx, rawConfig) {
         broadcast({ type: 'qq-status', ...qqGlobalState() })
       }
       if (!openid || !message.msgId) return
+      if (!isAllowedSender(openid)) {
+        await replyQQ(openid, message.msgId, allowlistHint(openid))
+        return
+      }
       if (await routeInbound(message)) return
       const hint = ambiguityHint()
       if (hint) {
@@ -1376,6 +1380,22 @@ export function apply(ctx, rawConfig) {
       .filter(Boolean)
     if (configured.length > 0) return configured.includes(openid)
     return qqLearned.includes(openid)
+  }
+
+  /**
+   * Say why a message was ignored instead of answering with the connection
+   * guide. A hand-typed `qqOpenids` is the usual culprit — most often the AppID
+   * pasted in place of the user openid, which silently disables every command.
+   */
+  function allowlistHint(openid) {
+    const configured = String(cfg().qqOpenids ?? '').trim()
+    return [
+      '**这条消息被 openid 白名单挡住了**',
+      `你的用户 openid：\`${openid}\``,
+      `设置里「接收通知的 openid」现在填的是：\`${configured}\``,
+      '改成上面那串，或者直接留空——留空会自动认所有给机器人发过消息的人。',
+      'openid 是**用户**维度的，不是机器人 AppID，换机器人也不通用。',
+    ].join('\n')
   }
 
   function qqAnswerReady() {

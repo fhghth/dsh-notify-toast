@@ -41,6 +41,7 @@ const CODE_HINTS = {
   40054007: '消息长度超限',
   40054013: '用户已在 QQ 客户端关闭「允许主动发送」',
   40054016: '机器人已下线',
+  304076: '接收者 openid 无效（是不是把 AppID 填成了 openid）',
 }
 
 export class QQBotApiError extends Error {
@@ -112,11 +113,11 @@ export function createApi(options) {
   function assertOk(status, body) {
     if (body && typeof body.code === 'number' && body.code !== 0) {
       const message = body.message ? String(body.message) : 'unknown error'
-      throw new QQBotApiError(`QQ OpenAPI 拒绝：code=${body.code} ${message}`, {
-        code: body.code,
-        status,
-        body,
-      })
+      const hint = CODE_HINTS[body.code]
+      throw new QQBotApiError(
+        `QQ OpenAPI 拒绝：code=${body.code} ${message}` + (hint ? `（${hint}）` : ''),
+        { code: body.code, status, body },
+      )
     }
     if (status >= 400) {
       throw new QQBotApiError(`QQ OpenAPI HTTP ${status}`, { status, body })

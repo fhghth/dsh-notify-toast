@@ -150,6 +150,18 @@ test('api: platform error code maps to a hint', { timeout: 5000 }, async () => {
   })
 })
 
+test('api: 304076 names the AppID-instead-of-openid mistake', { timeout: 5000 }, async () => {
+  await withMock({ sendError: { code: 304076, message: 'req err' } }, async (mock) => {
+    const api = apiFor(mock)
+    await assert.rejects(() => api.sendC2C('1906452167', { markdown: 'x' }), (error) => {
+      assert.equal(error.code, 304076)
+      assert.match(error.hint, /openid/)
+      assert.match(error.message, /AppID/)
+      return true
+    })
+  })
+})
+
 // ── gateway ────────────────────────────────────────────────────────────────
 
 test('close code policy matches the official table', () => {

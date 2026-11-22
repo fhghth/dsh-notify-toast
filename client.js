@@ -124,7 +124,7 @@ window.__ModuleLoader__.load({
           { key: 'qqEnabled', label: '启用 QQ 通知通道', type: 'bool', hint: '需要在 QQ 开放平台单独创建一个通知机器人' },
           { key: 'qqAppId', label: '机器人 AppID', type: 'text' },
           { key: 'qqAppSecret', label: '机器人 AppSecret', type: 'secret', hint: '保存在 profile 配置里，仅本机可见' },
-          { key: 'qqOpenids', label: '接收通知的 openid', type: 'text', hint: '多个用逗号分隔；留空则自动使用第一个给机器人发过消息的人' },
+          { key: 'qqOpenids', label: '接收通知的 openid', type: 'text', hint: '多个用逗号分隔；留空则自动使用第一个给机器人发过消息的人。注意填的是用户 openid，不是机器人 AppID' },
           { key: 'qqNotifyOnComplete', label: '任务完成时推送到 QQ', type: 'bool' },
           { key: 'qqNotifyOnError', label: '失败 / 中断时推送到 QQ', type: 'bool' },
           { key: 'qqMinIntervalMs', label: 'QQ 同会话最小间隔（毫秒）', type: 'number' },
