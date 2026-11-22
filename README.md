@@ -51,7 +51,7 @@ DSH 插件（仅 Windows 10/11）：任务完成、需要权限审批、或 Agen
 
 ```text
 plugin_manager install_bundle
-target = @luoluo147/dsh-notify-toast@1.3.0
+target = @luoluo147/dsh-notify-toast@1.3.1
 ```
 
 - 走 npm 仓库，国内网络还会自动回退到 npmmirror 镜像，比拉 GitHub 稳
@@ -71,7 +71,7 @@ target = D:\path\to\dsh-notify-toast
 
 - **插件** 页出现「桌面弹窗通知」，状态是运行中
 - 能打开它的设置页，点「预览完成卡」会弹出一张卡片
-- 如果启用失败、日志里是 `ERR_MODULE_NOT_FOUND`：装到的是 1.2.0 或更早的坏包（`files` 里漏了 `qq-reply.js`、`qq-changes.js`），换 1.2.1 以上（当前 1.3.0）
+- 如果启用失败、日志里是 `ERR_MODULE_NOT_FOUND`：装到的是 1.2.0 或更早的坏包（`files` 里漏了 `qq-reply.js`、`qq-changes.js`），换 1.2.1 以上（当前 1.3.1）
 
 ## 使用
 
@@ -135,7 +135,7 @@ Host 插件（`index.js`）收到 `approval/asked`、`ask_user_question`、`turn
 
 | 现象 | 处理 |
 |---|---|
-| 启用失败，`ERR_MODULE_NOT_FOUND` | 装的是 1.2.0 或更早的坏包，换 1.2.1 以上（当前 1.3.0） |
+| 启用失败，`ERR_MODULE_NOT_FOUND` | 装的是 1.2.0 或更早的坏包，换 1.2.1 以上（当前 1.3.1） |
 | 装完没反应 | 刷新页面；还不行就重启 DSH |
 | 卡片不弹 | 检查 `enabled` 与四类分类开关；虚拟桌面 / 全屏 / 锁屏下看不到是正常现象 |
 | QQ 未连接 | 检查 AppID / AppSecret；机器人必须是好友关系；确认没有别处占用同一个 AppID |
