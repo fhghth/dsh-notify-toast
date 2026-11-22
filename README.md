@@ -1,6 +1,7 @@
 # 桌面弹窗通知 · dsh-notify-toast
 
 [![version](https://img.shields.io/github/package-json/v/fhghth/dsh-notify-toast)](https://github.com/fhghth/dsh-notify-toast/blob/master/package.json)
+[![npm](https://img.shields.io/npm/v/@luoluo147/dsh-notify-toast)](https://www.npmjs.com/package/@luoluo147/dsh-notify-toast)
 [![stars](https://img.shields.io/github/stars/fhghth/dsh-notify-toast)](https://github.com/fhghth/dsh-notify-toast/stargazers)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6)](#系统要求)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -42,20 +43,20 @@ DSH 插件（仅 Windows 10/11）：任务完成、需要权限审批、或 Agen
 3. 在列表里找到 **桌面弹窗通知**，点 **安装** 并确认
 4. 装完**刷新页面**（`F5`），客户端那一半才会加载
 
-索引里给出的安装目标钉在完整 commit 上，所以市场以后能识别「有更新」。
+索引里给出的是钉死的具体版本，所以市场以后能识别「有更新」。
 
-### 方式二：直接按 git commit 安装
+### 方式二：直接装 npm 包
 
-不想加索引，就让 Agent 装这个地址：
+不想加索引源，就让 Agent 装这个地址：
 
 ```text
 plugin_manager install_bundle
-target = git+https://github.com/fhghth/dsh-notify-toast.git#<完整 40 位 commit>
+target = @luoluo147/dsh-notify-toast@1.3.0
 ```
 
-- commit 用 `git ls-remote https://github.com/fhghth/dsh-notify-toast master` 取，或在 [commits 页面](https://github.com/fhghth/dsh-notify-toast/commits/master) 复制。
-- **一定要写完整 40 位**。写分支、tag、短 sha 也能装上，但市场认不出更新，以后只能卸载重装。
-- 这里填的是 **git 地址**，不是仓库首页或 raw 文件地址：安装时 npm 会按 `package.json` 的 `files` 重新打包，只有打包清单里的文件才会进 profile。
+- 走 npm 仓库，国内网络还会自动回退到 npmmirror 镜像，比拉 GitHub 稳
+- 版本号可以换；装完市场也能识别「有更新」
+- 想钉死某个 git 提交也可以：`git+https://github.com/fhghth/dsh-notify-toast.git#<完整 40 位 commit>` —— 写分支、tag、短 sha 装得上但市场认不出更新
 
 ### 方式三：从源码目录安装（改代码时用）
 
@@ -70,7 +71,7 @@ target = D:\path\to\dsh-notify-toast
 
 - **插件** 页出现「桌面弹窗通知」，状态是运行中
 - 能打开它的设置页，点「预览完成卡」会弹出一张卡片
-- 如果启用失败、日志里是 `ERR_MODULE_NOT_FOUND`：装到的是 1.2.0 或更早的坏包（`files` 里漏了 `qq-reply.js`、`qq-changes.js`），重装 1.2.1 以上即可
+- 如果启用失败、日志里是 `ERR_MODULE_NOT_FOUND`：装到的是 1.2.0 或更早的坏包（`files` 里漏了 `qq-reply.js`、`qq-changes.js`），换 1.2.1 以上（当前 1.3.0）
 
 ## 使用
 
@@ -134,7 +135,7 @@ Host 插件（`index.js`）收到 `approval/asked`、`ask_user_question`、`turn
 
 | 现象 | 处理 |
 |---|---|
-| 启用失败，`ERR_MODULE_NOT_FOUND` | 装的是 1.2.0 或更早的坏包，重装 1.2.1+ |
+| 启用失败，`ERR_MODULE_NOT_FOUND` | 装的是 1.2.0 或更早的坏包，换 1.2.1 以上（当前 1.3.0） |
 | 装完没反应 | 刷新页面；还不行就重启 DSH |
 | 卡片不弹 | 检查 `enabled` 与四类分类开关；虚拟桌面 / 全屏 / 锁屏下看不到是正常现象 |
 | QQ 未连接 | 检查 AppID / AppSecret；机器人必须是好友关系；确认没有别处占用同一个 AppID |
@@ -142,8 +143,9 @@ Host 插件（`index.js`）收到 `approval/asked`、`ask_user_question`、`turn
 ## 升级与卸载
 
 - **升级**：市场里点 **更新**；手动装的先移除再装（市场不覆盖已安装的包）
+- **包名变更**：1.3.0 起从 `@local/dsh-notify-toast` 改为 `@luoluo147/dsh-notify-toast`。之前用 git 地址装过的，先在插件页**移除旧包**再装新版，否则两个包会并存
 - **卸载**：在 **插件** 页禁用或移除，通知进程会随插件一起退出
-- `link:` 安装的残留：hoisted 模式下卸载后 `node_modules` 里可能留一个指向源码目录的 junction，不影响使用，换安装方式前可用 `Get-Item <profile>\node_modules\@local\dsh-notify-toast -Force` 确认
+- `link:` 安装的残留：hoisted 模式下卸载后 `node_modules` 里可能留一个指向源码目录的 junction，不影响使用，换安装方式前可用 `Get-Item <profile>\node_modules\@luoluo147\dsh-notify-toast -Force` 确认
 
 ## License
 

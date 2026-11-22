@@ -1,6 +1,9 @@
 {
-  "name": "@local/dsh-notify-toast",
-  "version": "1.2.1",
+  "name": "@luoluo147/dsh-notify-toast",
+  "version": "1.3.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Windows desktop popup cards for DSH task completion, approval requests and agent questions",
   "license": "MIT",
   "author": "fhghth",
@@ -39,6 +42,7 @@
     "notifier/demo.json",
     "qqbot-lite/*.js",
     "qqbot-lite/README.md",
+    "docs",
     "sounds/*.wav",
     "cordis.patch.yml",
     "locale/*.json",

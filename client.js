@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-notify-toast',
+  id: '@luoluo147/dsh-notify-toast',
   factory(require) {
     const React = require('react')
     const el = React.createElement
@@ -674,7 +674,7 @@ window.__ModuleLoader__.load({
         // Settings form on the bundle's page in Settings -> Plugins.
         ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
           name: 'plugins.bundle.config',
-          key: '@local/dsh-notify-toast',
+          key: '@luoluo147/dsh-notify-toast',
         }, BundleConfig))
 
         // Per-session QQ switch in the session header, beside the View tabs.

@@ -20,7 +20,7 @@
   },
   "plugins": [
     {
-      "name": "@local/dsh-notify-toast",
+      "name": "@luoluo147/dsh-notify-toast",
       "title": {
         "en": "Desktop Notifications",
         "zh": "桌面弹窗通知"
@@ -45,26 +45,15 @@
           "approval"
         ]
       },
+      "dist-tags": {
+        "latest": "1.3.0"
+      },
       "versions": [
         {
-          "version": "1.2.1",
-          "publishTimestamp": 1795314165,
+          "version": "1.3.0",
+          "publishTimestamp": 1795317102,
           "source": {
-            "type": "git",
-            "url": "https://github.com/fhghth/dsh-notify-toast",
-            "commit": "14d174a57bd97e434287420c21631b878a419e11"
-          },
-          "engines": {
-            "dsh": ">=0.2.1-rc.3"
-          }
-        },
-        {
-          "version": "1.0.1",
-          "publishTimestamp": 1792838526,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/fhghth/dsh-notify-toast",
-            "commit": "3fd5b91a41a52ddd56ef02ab2a9da058aecc5316"
+            "type": "npm"
           },
           "engines": {
             "dsh": ">=0.2.1-rc.3"
