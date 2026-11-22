@@ -813,6 +813,36 @@ export function apply(ctx, rawConfig) {
     if (qqStatus.state !== 'disabled') setQQStatus('disabled', '')
   }
 
+  /**
+   * Which inputs decide whether the gateway runs.
+   *
+   * Every config field is `.volatile()`: the settings service swaps the live
+   * reference instead of reloading this plugin, so `apply` never runs again
+   * after a save. Without a signature nothing would start the bridge the first
+   * time someone enables QQ, and editing the AppID would keep the old socket.
+   */
+  let qqBridgeSignature = ''
+  function currentQQSignature() {
+    const current = cfg()
+    return [
+      current.qqEnabled ? 'on' : 'off',
+      String(current.qqAppId || ''),
+      current.qqAppSecret ? 'secret:' + String(current.qqAppSecret).length : 'secret:none',
+    ].join('|')
+  }
+
+  function syncQQBridge() {
+    try {
+      const next = currentQQSignature()
+      if (next === qqBridgeSignature) return
+      qqBridgeSignature = next
+      stopQQBridge()
+      startQQBridge()
+    } catch (error) {
+      console.warn('[notify-toast] QQ 重连失败:', error && error.message ? error.message : error)
+    }
+  }
+
   function startQQBridge() {
     const current = cfg()
     if (!current.qqEnabled) {
@@ -2819,6 +2849,9 @@ export function apply(ctx, rawConfig) {
           const values = payload && typeof payload.values === 'object' && payload.values ? payload.values : {}
           await settings.update(NS, values, typeof payload.revision === 'number' ? payload.revision : undefined)
           const descriptor = describeSelf()
+          // A save is the common way QQ gets enabled, and volatile values never
+          // re-apply the plugin: nudge the bridge once the new values are live.
+          later(() => syncQQBridge(), 200)
           send(200, { ok: true, revision: descriptor ? descriptor.revision : 0, values: descriptor ? descriptor.value : values })
           return
         }
@@ -2870,8 +2903,13 @@ export function apply(ctx, rawConfig) {
     loadQQState()
     backfillTitles()
     pruneStaleSubscriptions()
+    qqBridgeSignature = currentQQSignature()
     startQQBridge()
+    // Volatile config reaches this plugin by reference; the loader announces
+    // the change instead of re-applying the plugin, so follow it here.
+    const offVolatile = ctx.on('loader/volatile-update', () => syncQQBridge())
     return () => {
+      try { if (typeof offVolatile === 'function') offVolatile() } catch {}
       stopQQBridge()
       if (qqStateTimer) {
         cancel(qqStateTimer)

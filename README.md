@@ -139,6 +139,7 @@ Host 插件（`index.js`）收到 `approval/asked`、`ask_user_question`、`turn
 | 装完没反应 | 刷新页面；还不行就重启 DSH |
 | 卡片不弹 | 检查 `enabled` 与四类分类开关；虚拟桌面 / 全屏 / 锁屏下看不到是正常现象 |
 | QQ 未连接 | 检查 AppID / AppSecret；机器人必须是好友关系；确认没有别处占用同一个 AppID |
+| 填完 QQ 设置仍显示未连接 | 1.3.0 及更早在保存设置后不会自动拉起 QQ 通道，重启 DSH 即可；1.3.1 起保存后会自动重连 |
 
 ## 升级与卸载
 
